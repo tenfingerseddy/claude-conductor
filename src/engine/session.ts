@@ -175,6 +175,16 @@ const CUT_BACKSTOP_MS = 30_000;
 const RAIL_APPROVAL_TIMEOUT_SECONDS = 600;
 
 export async function runSession(config: Config, task: Task, options: RunSessionOptions): Promise<SessionResult> {
+  // Gate zero, and the only one that is part of the engine rather than in front of it. Sol's gate
+  // pass, finding 3: the queue and the task loop both refuse autonomous trust, but runSession is
+  // exported, so in-process code could hand it an autonomous task and start a session anyway. The
+  // claim "nothing runs unattended" is about the system, and the boundary that starts sessions has
+  // to hold it. This throws rather than returning a result, because a caller reaching here has
+  // skipped a check it should have made and a quiet empty result would hide that. The other two
+  // gates stay as defence in depth, not as the only guards.
+  const refusal = trustRefusal(task.trust);
+  if (refusal) throw new Error(`conductor: ${refusal}`);
+
   const { gauge, configDir } = options;
 
   // Boxed because the tool handler assigns it from a closure and the runner reads it afterwards.
@@ -255,6 +265,21 @@ export async function runSession(config: Config, task: Task, options: RunSession
   const sdkOptions: Options = {
     cwd: task.cwd,
     ...(task.model ? { model: task.model } : {}),
+    // Both rail layers only see tool calls, and a settings-file hook or a stdio MCP server is a
+    // process launch instead. Left at their defaults these two options let a session load whatever
+    // settings and MCP config the task folder or the user profile carries, so a `SessionStart`
+    // command hook in the target project runs a shell with no tap at all. Sol's gate pass, finding
+    // 1. Empty settingSources loads no settings files; strictMcpConfig means the only MCP server is
+    // the finish_task one built above.
+    //
+    // The cost, taken deliberately for M1: with no setting sources the target project's own
+    // CLAUDE.md and settings no longer load, which the spec's architecture section says a session
+    // should have. That is accepted here because the same two lines also close the separate finding
+    // where a parent CLAUDE.md and the account's email address flowed verbatim into every fresh
+    // session. What the permanent policy should be is an open question in PLAN.md for M2 and is not
+    // decided here; M1 is made safe and says so.
+    settingSources: [],
+    strictMcpConfig: true,
     // The whole account mechanism (S1). env replaces the child environment when set, so process.env
     // is spread first for PATH and friends, then the key that must never be present is removed.
     env: childEnv(configDir),
@@ -596,10 +621,33 @@ export interface RailVerdict {
   reason: string;
 }
 
-// Tools that hand a string to an interpreter. Everything one of these runs is risky unless the
-// classifier can positively vouch for it. Matching is on the name because the SDK's Bash tool is
-// the one that exists today and a renamed or added shell tool must not silently fall out of scope.
-const SHELL_TOOL = /(^|_)(bash|sh|shell|zsh|cmd|powershell|pwsh|exec|execute|terminal|run_command|command)($|_)/i;
+// Tools that hand a string to an interpreter or otherwise start a process. Everything one of these
+// runs is risky: the vouched-safe set is empty, so matching here means a tap.
+//
+// Matching is on the name because Bash is the tool that exists today and an MCP server may call its
+// process tool anything at all. Sol's gate pass, finding 2: the first version of this list matched
+// `run_command` but not `run_script`, `python`, `spawn` or `script`, and the note claiming a renamed
+// shell tool could not fall out of scope was wrong. The list is now deliberately generous, because
+// the two errors cost different amounts. A false match costs one tap, and under attended trust that
+// call was going to be confirmed by a human anyway. A miss costs the rail.
+const SHELL_TOOL =
+  /(^|_)(bash|sh|shell|zsh|ksh|fish|cmd|command|powershell|pwsh|exec|execute|eval|terminal|console|run|runner|script|spawn|fork|launch|start|process|subprocess|system|proc|python\d*|node|deno|bun|ruby|perl|php|osascript|applescript|interpreter|repl|notebook_exec)($|_)/i;
+
+/** `runScript` and `run_script` are one tool in two costumes, so the matcher sees both as segments. */
+function nameSegments(toolName: string): string {
+  return toolName.replace(/([a-z0-9])([A-Z])/g, '$1_$2');
+}
+
+// Field names that carry the thing to be run. These convict a tool of being shell-shaped on their
+// own, whatever it is called, because a call carrying `script` or `code` runs a script or code.
+const COMMAND_FIELDS = [
+  'command', 'cmd', 'command_line', 'commandLine', 'commandline', 'shell_command', 'shellCommand',
+  'script', 'code', 'program', 'executable', 'exe', 'binary', 'interpreter', 'entrypoint', 'snippet',
+];
+
+// Read only once a tool is already shell-shaped. `args` is too ordinary a field name to convict a
+// tool on, but once something is running a process its arguments are part of what it runs.
+const ARGUMENT_FIELDS = ['args', 'argv', 'arguments', 'flags', 'options', 'parameters'];
 
 /**
  * Returns why an action needs a human, or null when it is ordinary work inside the task folder.
@@ -635,7 +683,7 @@ export function classifyRail(task: Task, toolName: string, input: Record<string,
   }
 
   const command = commandText(input);
-  const shellShaped = SHELL_TOOL.test(toolName) || command !== null;
+  const shellShaped = SHELL_TOOL.test(nameSegments(toolName)) || command !== null;
   if (!shellShaped) return null;
 
   if (command === null) {
@@ -657,11 +705,28 @@ export function classifyRail(task: Task, toolName: string, input: Record<string,
 const SHELL_UNVOUCHABLE =
   'Conductor cannot tell what a shell command will do once the shell has finished rewriting it, so every command goes to a human';
 
-/** Tool inputs spell a command as a string or as an argv array. Both get read. */
+/**
+ * The text a shell-shaped call is asking to run, or null when there is none this can read.
+ *
+ * Null is not "safe". A shell-shaped tool whose arguments cannot be read is refused by classifyRail
+ * as unvouched, which is the same answer it gives a command it can read perfectly well. Reading more
+ * fields buys a better sentence for the human and a chance for the destructive and elevation
+ * patterns to fire, never a way through.
+ */
 function commandText(input: Record<string, unknown>): string | null {
-  const raw = input['command'];
-  if (typeof raw === 'string') return raw;
-  if (Array.isArray(raw)) return raw.filter((part) => typeof part === 'string').join(' ');
+  const parts = COMMAND_FIELDS.map((field) => textOf(input[field])).filter((part) => part !== null);
+  if (parts.length === 0) return null;
+  const args = ARGUMENT_FIELDS.map((field) => textOf(input[field])).filter((part) => part !== null);
+  return [...parts, ...args].join(' ');
+}
+
+/** A field spells its value as a string or as an argv array. Both get read; anything else is null. */
+function textOf(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    const words = value.filter((part): part is string => typeof part === 'string');
+    return words.length > 0 ? words.join(' ') : null;
+  }
   return null;
 }
 

@@ -22,6 +22,11 @@ is no version of that game worth playing, so Conductor stops playing it.
 Publishing scrub rule applied: scratch paths are shortened to `<scratch>`. Command text, event lines
 and verdicts are verbatim.
 
+**Corrected on 2026-08-01 by `m1-gatefix-findings.md`.** Sol's gate pass read this note against the
+code and found two of its sentences claimed more than the code held. Both are marked **CORRECTED**
+where they appear below. Nothing else in this note changed, and none of the evidence it reports was
+withdrawn.
+
 ## Closure table
 
 | # | Sol's final finding | Action | Evidence |
@@ -104,9 +109,18 @@ The last six lines are the accepted cost, printed rather than hidden. `ls` taps.
 `pwd` taps. In attended mode a human is watching, so a human seeing every command a session runs is
 the correct behaviour, and that is the whole justification.
 
-Shell-shaped tools are matched by name as well as by carrying a command, so a renamed or added shell
-tool does not fall out of scope, and a shell tool with no readable command is refused rather than
-ignored:
+**CORRECTED.** This section originally said that because shell-shaped tools are matched by name as
+well as by carrying a command, a renamed or added shell tool does not fall out of scope. That was
+too strong and Sol's gate pass proved it wrong. The name pattern of the day matched `run_command`
+and `command`, but not `run_script`, `python`, `spawn` or `script`, and the command reader looked at
+the `command` field and nothing else. A tool named `mcp__ops__run_script` taking a `script` field
+matched neither test and produced no verdict at all.
+
+The truth is narrower than the claim was: what the rail guarantees is that a tool it recognises as
+shell-shaped is never vouched safe. Recognising them was a list, and a list can be short. The list
+has since been widened in both directions, by name and by field, and a shell-shaped tool whose
+arguments cannot be read is refused rather than ignored. See `m1-gatefix-findings.md`. The six lines
+below were true when written and are still true:
 
 ```
 TAP  tool Bash
@@ -197,6 +211,13 @@ refusal lands before the account is resolved, so no session starts and nothing i
 
 This is what closes every "it ran and no human was asked" finding for M1. Nothing runs unattended,
 so the question does not arise.
+
+**CORRECTED.** "Both gates" was two gates in front of the engine, and the engine itself had none.
+`runSession` was exported and never called `trustRefusal`, so in-process code could hand it an
+autonomous task and start a session with both gates untouched. No HTTP path reached it, so this was
+a defence-in-depth gap rather than a way in, but the sentence above is a claim about the system and
+the boundary that starts sessions did not hold it. There are now three gates and the third is inside
+`runSession`. See `m1-gatefix-findings.md`.
 
 ## Structured work still flows
 
