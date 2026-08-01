@@ -305,6 +305,18 @@ src/
 gauge line appears on every turn, and `events.jsonl` holds the full story. Raw terminal output
 pasted into this file.
 
+**Run 2026-08-01, the loop held.** Two Haiku tasks through the real daemon and CLI, 92 seconds,
+one tap. Task 1 (attended) indexed `fieldbook/` and wrote `conductor-demo/index.md` only after a
+real approval was answered y at `conductor watch`. Fresh cut fired, task 2 started on a new
+session 1.5 seconds later, autonomous, confined to the demo folder, and wrote `summary.md` from
+the handoff alone; its own handoff names all four things it used from the note. Gauge moved as
+designed: task 1 opened on `official, from disk` at 0 self-metered tokens, task 2 saw
+`official, live` on both windows with 212.2k self-metered, and one calibration event fired with
+gap 0. No backstop compacts, no rail stops. Nothing in nexwave-apps changed except the two new
+files; no git ran there. Full transcripts and events trail:
+`docs/notes/m1-finishline-findings.md`. Four wrinkles captured, not patched, listed under open
+questions; they go to the Sol review and one fix slice.
+
 ## Parked for later milestones
 
 Written down so they do not leak into M1.
@@ -333,6 +345,16 @@ Things not settled. Add to this list rather than guessing.
   limit, personal has them disabled. The cross-account gauge cannot assume one layout.
 - Tailscale is installed but in NoState with no IP on this machine. The live Tailscale bind check
   from S5 re-runs once Kane logs Tailscale in. Blocks M5 only.
+- From the finish line run, four wrinkles for the fix slice: (1) attended approvals of ordinary
+  work write no events.jsonl line, only rail verdicts log, which breaks "every decision is
+  logged"; (2) attended trust never asked about Read, Glob, or two Bash ls calls, and it is not a
+  settings shadow, so the SDK's default-mode auto-allows need mapping before D9 can be called
+  fully honest; (3) task 2 credited a CLAUDE.md above its cwd, so a fresh cut is not a clean
+  room, parent CLAUDE.md files flow in (platform behavior; document it, decide if the playbook
+  should mention it); (4) `daemon_stop` never logs because Windows cannot deliver SIGINT to the
+  child, needs a Windows-appropriate shutdown path.
+- Follow-up tasks from `finish_task` are recorded but not auto-queued; the carry lives inside one
+  `runTasks` call. Known M1 shape; the real queue is M2's first job.
 - Mid-task gauge refresh. The spec says the gauge line is injected every turn; the documented
   injection point fires per user prompt, and the one-task-one-prompt loop means once per task.
   So the mid-task checkpoint currently has no live trigger between prompts. Candidate fixes for
