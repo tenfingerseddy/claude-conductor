@@ -684,10 +684,16 @@ Only after A and B.
 - [ ] Playbook hard rails enforced by the service, not just advised.
 - [ ] Subagent registry with per-profile model, effort, and account routing, plus the honesty line
       about legitimate account use in the playbook.
-- [ ] `model_change` logbook event. The harness can switch the model mid-run without asking, as it
-      did twice on 2026-08-01 via refusal fallback. A harness that silently changes the model is
-      exactly what the logbook exists to catch, and per-model spend in the gauge depends on
-      knowing which model actually ran.
+- [ ] `model_change` logbook event, plus restore. The harness can switch the model mid-run without
+      asking, as it did twice on 2026-08-01 via refusal fallback, and that swap is persistent by
+      design. Watch for the `model_refusal_fallback` notice, log it with its refusal category, and
+      call `setModel` to put the task back on the model it asked for. A harness that silently
+      changes the model is exactly what the logbook exists to catch, and per-model spend in the
+      gauge depends on knowing which model actually ran.
+- [ ] Playbook rule for refusal fallbacks: restore silently, or decline the swap up front via the
+      opt-in `refusal_fallback_prompt` dialog. Kane's call, not the code's. Note the work most
+      likely to trigger it is Conductor's own rail hardening, so this fires during development,
+      not just in production.
 - Finish line: a rail in the playbook demonstrably stops the service, not just the model.
 
 ## Parked for later milestones
@@ -736,6 +742,29 @@ who did the work when it matters.
 **For Conductor's own design:** the harness changed the model mid-run and told nobody but the
 transcript. That is precisely a `model_change` event the logbook should carry, and it strengthens
 the case for the gauge tracking per-model spend. Booked into M2 slice F.
+
+**Follow-up, answered from the installed SDK's own type definitions** (`sdk.d.ts` in
+`spikes/s1/node_modules/@anthropic-ai/claude-agent-sdk`, primary source rather than docs):
+
+- **The SDK can switch models mid-session.** `setModel(model?: string)` changes the model for
+  subsequent responses, available in streaming input mode; passing nothing restores the default.
+  `supportedModels()` lists what is available. This is more than the spec assumed: Conductor gets
+  per-task model choice *and* mid-task model change, which makes the playbook's model rules
+  enforceable at a turn boundary rather than only at a cut.
+- **Two fallback mechanisms exist, with opposite persistence, and we hit the sticky one.** The
+  `fallbackModel` option covers an overloaded or unavailable model, and the primary is retried at
+  the start of every user turn so an outage cannot permanently demote a session. The *refusal*
+  fallback is different: the type comment says the swap is "made persistent for the session", and
+  the `revert` direction is retained only for consumer compatibility and is no longer emitted. It
+  is designed not to switch back. Nothing restores the original model without an explicit call.
+- **The switch is observable.** A `model_refusal_fallback` notice carries the original model, the
+  fallback model, the refusal category, and the uuids of retracted messages. A
+  `model_refusal_no_fallback` notice covers the case where no retry runs.
+- **Conductor's response, booked into M2 slice F:** watch for that notice, log it as
+  `model_change` with the category, and call `setModel` to restore the model the task asked for.
+  There is also an opt-in `refusal_fallback_prompt` dialog, gated on the consumer declaring it can
+  render that dialog kind, so a task could decline the swap rather than discover it afterwards.
+  Which of restore-silently or ask-first is right is a playbook rule, not a code decision.
 
 ## Overnight run, 2026-08-01
 
