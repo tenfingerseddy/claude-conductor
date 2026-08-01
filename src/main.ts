@@ -11,7 +11,7 @@ import { loadConfig, resolveAccount, usableAccounts, type Config } from './confi
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
 import { Gauge } from './engine/gauge.ts';
-import { runSession, type Approver, type SessionHandle, type Task } from './engine/session.ts';
+import { runSession, trustRefusal, type Approver, type SessionHandle, type Task } from './engine/session.ts';
 import { startDaemon } from './server/http.ts';
 import { logEvent, type TokenUsage } from './state/logbook.ts';
 import { readPlaybook } from './state/playbook.ts';
@@ -73,6 +73,19 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
 
   try {
     for (const task of claimed) {
+      // Gate two of two for autonomous trust. The queue refuses it on the way in; this refuses it
+      // on the way out, so a task queued by an older daemon or written straight into the list is
+      // still blocked rather than started. It is never downgraded to attended: a task written for
+      // nobody to watch should be re-queued by a human, not reinterpreted by Conductor.
+      const refusal = trustRefusal(task.trust);
+      if (refusal) {
+        const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: refusal };
+        runs.push(blocked);
+        logTaskFinish(config, task.id, 'blocked', null, null, {});
+        options.onTaskFinish?.(blocked);
+        continue;
+      }
+
       // The execution path resolves accounts through the same validation the listing path uses,
       // and does not re-check placeholder and existence itself. Sol's re-check finding 7: the old
       // copy of the rules here missed the repository guard, so an account holding a login inside a

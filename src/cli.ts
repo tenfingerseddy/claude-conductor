@@ -17,7 +17,8 @@ const USAGE = `conductor <command>
   status                       daemon health, current task, task list
   gauge                        every account, every bucket, with source and freshness
   add <prompt> --cwd <dir>     queue a task
-       [--account <name>] [--trust attended|autonomous] [--model <model>] [--title <text>]
+       [--account <name>] [--model <model>] [--title <text>]
+                               every task is attended: --trust autonomous is refused until M2
   run                          start working the pending list
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)

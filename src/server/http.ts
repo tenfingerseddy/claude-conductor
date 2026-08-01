@@ -27,7 +27,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { loadConfig, usableAccounts, type Config } from '../config.ts';
 import { Gauge } from '../engine/gauge.ts';
 import type { Carry } from '../engine/cut.ts';
-import type { ApprovalOutcome, ApprovalRequest, SessionHandle, Task, Trust } from '../engine/session.ts';
+import { trustRefusal, type ApprovalOutcome, type ApprovalRequest, type SessionHandle, type Task, type Trust } from '../engine/session.ts';
 import { runTasks, VERSION, type TaskRun } from '../main.ts';
 import { logEvent } from '../state/logbook.ts';
 import { mintDaemonToken, tokenMatches } from '../state/token.ts';
@@ -295,6 +295,10 @@ class Daemon {
 
     const trustRaw = typeof body['trust'] === 'string' ? body['trust'] : 'attended';
     if (trustRaw !== 'attended' && trustRaw !== 'autonomous') return { error: 'trust must be attended or autonomous' };
+    // Gate one of two. The task loop refuses the same thing again at run time, so a task that got
+    // into the list some other way still cannot start.
+    const refusal = trustRefusal(trustRaw as Trust);
+    if (refusal) return { error: refusal };
 
     const account = typeof body['account'] === 'string' && body['account'].trim() ? body['account'].trim() : this.defaultAccount();
     if (!account) return { error: `no usable account; edit "${this.config.configFilePath}"` };
