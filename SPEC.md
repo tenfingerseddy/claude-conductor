@@ -329,6 +329,17 @@ kept alive so no capability becomes VS Code-only.
 - Interpreters are never treated as safe, whatever they point at. A session can write a script and
   then run it, so vouching for the runner vouches for anything. Two review rounds of v1 were failed
   on exactly this.
+- **Shell command strings are not classifiable, and Conductor does not pretend otherwise.** Three
+  adversarial review rounds failed three successive versions of a command classifier, each for the
+  same reason: the rail judges a string that the shell then transforms again, by joining adjacent
+  quoted fragments, expanding braces, or resolving a name to a file the session just wrote. Each
+  round closed its named holes and the next found new ones through the same door. The lesson is
+  that the input is the wrong shape, not that the list was too short. Two consequences. In v1 the
+  vouched-safe set is empty: every shell call stops for a human, and unattended trust is refused
+  outright. Beyond v1, the answer is to remove the transformation rather than model it, by running
+  commands as argument vectors with no shell to re-parse them, and by enforcing place at the
+  filesystem rather than by reading strings. Structured file tools never touch a shell, so their
+  path scoping is sound and needs none of this.
 - Project folders reachable from the phone are an explicit allowlist.
 - Secrets: no Anthropic credentials in the repo or the state files. Logins stay where the official
   tools store them. `ANTHROPIC_API_KEY` stays unset everywhere so subscription auth is used.
