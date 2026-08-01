@@ -576,6 +576,13 @@ Append here when a design call is made during the build. Date, decision, reason,
 - 2026-08-01. Fresh cut confirmed as default cut mode with evidence, not just preference. Reason:
   S3 showed compact focus steers but does not redact, summaries can confabulate, and compaction
   cost is invisible to usage reporting.
+- 2026-08-01. Gauge freshness has two tests, not one, learned live during the overnight pause. A
+  reading is stale if `fetchedAtMs` is old, and separately a reading is **expired** if its own
+  `resets_at` has passed, because it then describes a window that no longer exists. At 12:22 UTC
+  the work account's file still read 100% from a 51-minute-old fetch whose reset was 12:20, so
+  the honest reading was "that window is gone, assume it rolled over, fall back to self-metering
+  from the reset moment". A gauge that checked only fetch age would have reported a full tank as
+  empty and stopped work for hours. Both tests ship in M2's gauge work.
 - 2026-08-01. Gauge source stack settled: (1) the SDK's experimental usage method for the account
   running a session, at task boundaries, defensively wrapped; (2) `rate_limit_event` as a live
   pressure interrupt; (3) `.claude.json` file read for idle accounts, gated on `fetchedAtMs`;
