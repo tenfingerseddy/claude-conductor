@@ -1,7 +1,10 @@
 # Conductor, a self-managing harness for Claude
 
-Working name: **Conductor**. Placeholder, rename freely. Revision 4, 2026-08-01: revision 3 plus
-the inbox, continuous brain dumps, and provenance grading. Revision 3 the same day added the
+Working name: **Conductor**. Placeholder, rename freely. Revision 5, 2026-08-02: tasks work in
+their own isolated copy of a project, replacing the checkpoint-and-undo model, because two rounds
+of adversarial review showed that comparing a live folder before and after proves timing rather
+than authorship and would destroy the human's concurrent work. Revision 4, 2026-08-01: revision 3
+plus the inbox, continuous brain dumps, and provenance grading. Revision 3 the same day added the
 reversibility model and the permissive default, a fourth state thing (the notebook), subagent
 account routing, evidence-backed finish_task, and dropped compact cut. Written after M0's five
 spikes and M1's build, so the platform claims here are measured, not assumed. This repo is
@@ -53,19 +56,29 @@ way. The intelligence stays in the model. The tool stays small.
 - **Give Claude eyes, rules, and memory. Do not build a boss.** Conductor never overrides Claude's
   judgment except at a few hard rails written in the policy file.
 - **Reversibility buys permission.** The reason to interrupt a human is that a mistake is expensive
-  to undo, so Conductor attacks the undo instead of the permission. It checkpoints the work before
-  every task, which makes almost everything inside a project folder erasable with one command.
-  Work that is reversible runs without asking and is reported afterwards. Work that is not
-  reversible stops for a human. The permissive default is earned by the checkpoint, never assumed.
+  to undo, so Conductor attacks the undo instead of the permission. Work that is reversible runs
+  without asking and is reported afterwards; work that is not reversible stops for a human. The
+  permissive default is earned by that property, never assumed.
+- **Isolation is what makes reversal exact.** Each task works in its own copy of the project, not
+  in the folder the human is watching. This is not caution, it is the only way the reversal claim
+  survives contact with review. Two rounds of adversarial review killed the alternative, where a
+  task edited the live folder and a before-and-after comparison decided what to put back. That
+  comparison proves timing, never authorship: an edit the human makes while a task runs is
+  indistinguishable from the task's own, so undo would destroy the human's work and report it as
+  cleanup. Isolation replaces an inference with a structural fact. Nobody else writes in that
+  copy, so everything in it is the task's, and undo stops being a careful selective restore and
+  becomes discarding the copy, which is total, instant and exact. The same move settled the
+  permission rail: remove the thing rather than model it.
 - **Provenance outranks convenience.** What the human said in their own words is the strongest
   input. A pick from options an AI framed is weaker, because the framing is the AI's; such picks
   are marked and re-put later in plain terms. An AI recommendation is marked as one and never
   quietly promoted into the human's position. Losing this distinction is how a plan ends up
   reflecting the assistant's assumptions while everyone believes it reflects the human's.
 - **Scope by place, not by command.** Guessing which commands are dangerous is a losing game; an
-  adversarial review of v1 walked through the first two attempts. Inside an allowlisted project
-  folder, near-total freedom. Outside it, a hard stop regardless of trust level. Place is a
-  boundary Conductor can enforce honestly.
+  adversarial review of v1 walked through the first two attempts. Inside the task's own working
+  copy, near-total freedom. Outside it, a hard stop regardless of trust level. Place is a boundary
+  Conductor can enforce honestly, and isolation is what makes the boundary a filesystem fact
+  rather than a judgement about a string.
 - **Simplicity budget.** State lives in four plain things: one policy file, one log file, one
   folder of handoff notes, one notebook of durable findings. Claude gets one custom tool in v1.
   Every feature must justify its bytes, and new ones are paid for by dropping old ones: the
@@ -145,9 +158,17 @@ Mechanics, all on documented SDK surface:
   dropped in revision 3: the spike found that focus instructions steer the summary without
   removing anything, that summaries invent details, and that compaction's own token cost is
   invisible to usage reporting. It was a second mechanism earning its keep on nothing.
-- **The checkpoint.** Before each task in a git project, the service commits the working tree to a
-  Conductor branch. This is what makes the permissive default safe, and it gives every door a
-  one-command undo of the last task.
+- **The isolated copy.** Each task runs in its own working copy of the project, created from a
+  named commit and living outside the user's folder, on its own branch. The task's output is
+  therefore a branch to review and merge rather than edits appearing under the human's hands.
+  Undo is discarding the copy. There is no before-image to capture, no plan to approve, and no
+  question about who changed what.
+  What this costs, stated because it is a real cost: a fresh copy contains only what version
+  control tracks, so local configuration, build output and anything else untracked is absent
+  unless deliberately provided. Uncommitted work in the human's own folder is not visible to the
+  task either; the service says so plainly when queueing rather than silently starting from an
+  older state. Work that genuinely needs the live folder is a separate mode carrying a weaker
+  guarantee, and it must say which guarantee it carries.
 - **Mid-task checkpoint.** If the gauge runs high mid-task, the injected gauge line tells Claude to
   call `finish_task` early with a checkpoint handoff. Same tool, no second mechanism.
 - **Backstop.** Auto-compact stays enabled as the emergency floor. A PreCompact hook logs every
