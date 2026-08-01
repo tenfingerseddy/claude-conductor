@@ -306,7 +306,22 @@ src/
 ### Review and land
 
 - [x] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
-- [~] Findings resolved or explicitly parked with a reason. Fix slice landed: 18 of 20 fixed and
+- [x] Sol confirmation pass: **passed**. `docs/notes/sol-review-m1-confirm.md`. Findings 1 and 3
+      confirmed fixed on every reachable path, finding 2 closed outright, no regression from any
+      of the three fixes. Two new findings, neither blocking: (A, medium) the managed policy tier
+      is read regardless of `settingSources`, so an admin-controlled hook could still launch a
+      process, verified in the installed SDK types; parked under the v1 threat model because
+      writing that tier needs administrator rights, which is more authority than the same-user
+      attacker already excluded, and this machine has zero managed sources. Our own findings file
+      overclaimed here and has been corrected. (B, low) a mutable `task.trust` getter could slip
+      past the refusal; judged a false positive since tasks arrive as plain JSON and the only
+      caller able to install such a getter is in-repo code that could bypass the engine entirely.
+      A one-line snapshot is cheap hygiene and is booked for M2 slice B. Sol also noted the tool
+      matcher is still not exhaustive but declined to report it, since `allowedTools` and
+      `strictMcpConfig` leave no tool able to reach the gaps; recorded, because that safety comes
+      from an empty tool surface rather than a complete matcher, and M2 must not widen the surface
+      without revisiting it.
+- [x] Findings resolved or explicitly parked with a reason. Fix slice landed: 18 of 20 fixed and
       mechanically demonstrated, 2 parked (handoff disk recovery and follow-up queueing, both
       belong to M2's durable queue), none contested. Closure table with evidence per finding in
       `docs/notes/m1-fixslice-findings.md`. Box closes when the Sol re-check passes.

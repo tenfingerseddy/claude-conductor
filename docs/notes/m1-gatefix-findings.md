@@ -116,6 +116,20 @@ fixed: planted code ran = false
 The marker file is not empty. It does not exist. Nothing planted in that folder ran, twice over, in
 sessions that did real work in the same folder at the same time.
 
+### Correction, added after Sol's confirmation pass
+
+This file originally read as though `settingSources: []` seals every settings-driven launch path.
+It does not, and Sol's confirmation pass caught the overclaim. The **managed policy tier is still
+read from disk** regardless of `settingSources`, verified in the installed SDK types rather than
+from documentation (`sdk.d.ts:2667-2670` and `sdk.d.ts:4970-4978`). An admin-controlled
+`policyHelper` or `SessionStart` hook in that tier can still start a process outside the rail.
+
+Why this is not a merge blocker: writing that tier requires administrator rights on the machine,
+which is strictly more authority than the same-user attacker the v1 threat model already excludes,
+and a live `resolveSettings` check returns zero managed sources on this machine. It is parked
+under that threat model, not fixed. The honest claim is that `settingSources: []` closes the
+project, user and local tiers, not that it closes everything.
+
 ### What this costs, said plainly
 
 `settingSources: []` means a target project's own `CLAUDE.md` and its own settings no longer load
