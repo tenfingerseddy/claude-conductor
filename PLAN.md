@@ -1,11 +1,50 @@
 # Conductor build plan
 
+## Morning report, 2026-08-01
+
+**M1 is merged to main. Conductor runs.** It does one task, cuts the context on purpose, carries a
+handoff into the next task, shows an honest gauge, logs everything, and takes commands from a CLI
+over a loopback server. Every claim there was demonstrated by running it, not by reading the code.
+
+**What it cannot do yet, deliberately.** It is attended-only. Every shell command stops for your
+tap, including `git status`. Unattended trust is refused outright. That is not caution for its own
+sake: three adversarial review rounds each broke a different attempt at deciding which commands
+are safe, so the design changed instead. Conductor no longer tries to classify shell strings. M2
+earns the freedom back with checkpoints, filesystem-level folder enforcement, and running commands
+as fixed argument lists that no shell can reinterpret.
+
+**The night in four beats.**
+
+1. The rail was rewritten as a deletion, 285 lines out. All nine of Sol's bypasses now stop.
+2. Sol failed the result anyway, correctly: sessions were loading settings from the target folder,
+   and a hook in a settings file launches a process without either rail layer seeing it. Fixed and
+   proven by planting hooks that fire under a raw SDK query and do not fire under Conductor.
+3. Your work account hit 100% of its five-hour window with paid credits enabled, so I stopped all
+   new work for 42 minutes rather than spend your money while you slept, and resumed after the
+   reset.
+4. Sol's confirmation pass passed. Two new findings, both parked with reasons, one overclaim in
+   our own notes corrected.
+
+**Two things I learned that changed the design.** Gauge freshness needs two tests, not one: a
+reading can be recent and still describe a window that has already reset, and checking age alone
+would have idled Conductor for hours on a full tank. And switching branches while a builder is
+working corrupts its tree, which is why documentation now lands on the working branch.
+
+**Waiting on you, nothing urgent.**
+
+- Two decisions deserve re-putting in your own words rather than as picks from my menu: approvals
+  (D9, because the reversibility model changed the question underneath it) and state location
+  (D5, chosen before either of us knew the repo was public).
+- `scope/conductor-demo/` in nexwave-apps is leftover from the finish-line run and can be deleted.
+- M2 is planned as six slices below, ordered so the permissive default is earned rather than
+  assumed. Slice A is checkpoints, which is the prerequisite for everything you asked for.
+
+
 Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says what we are building
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 complete. S1 green, S2 amber, S3 green, S4 green, S5 amber. Both ambers carry
-written fallbacks, so M1 begins per D1.** Last updated 2026-08-01.
+Status: **M0 complete, M1 merged to main. M2 planned, slice A next.** Last updated 2026-08-01.
 
 ## How to read this file
 
