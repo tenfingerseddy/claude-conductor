@@ -4,8 +4,8 @@ Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says wh
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 in progress. S1 green, S2 amber, S3 green (addendum in flight), S4 green. S5
-running.** Last updated 2026-08-01.
+Status: **M0 in progress. S1 green, S2 amber, S3 green, S4 green. S5 running (restarted after a
+laptop sleep).** Last updated 2026-08-01.
 
 ## How to read this file
 
@@ -126,9 +126,12 @@ Highest value. Blocks everything.
   `trigger: manual` vs auto. Caveats: focus steers but does not redact (dropped facts were still
   quoted inside the summary text), the summary confabulated a sentence, and the compact turn
   reports zero usage so the gauge must estimate compaction cost from `pre_tokens`. All three
-  caveats argue for fresh cut as default, which the spec already chose. Bonus find: the stream
-  carries a `rate_limit_event` message with fresh official limit data; characterization addendum
-  in flight.
+  caveats argue for fresh cut as default, which the spec already chose. Two bonus finds,
+  characterized in the addendum: the stream carries an undocumented `rate_limit_event` (typed in
+  the SDK's own d.ts) that fires when limit info changes and carries a status of allowed, warning,
+  or rejected; and the SDK `Query` object exposes an experimental usage method that returns the
+  full official usage data (both windows, per-model buckets, extra-usage credits, `is_active`)
+  fresh from the live session on demand.
 
 ### S4, usage buckets
 
@@ -241,10 +244,13 @@ Things not settled. Add to this list rather than guessing.
 
 - Do two simultaneous SDK sessions on two different `CLAUDE_CONFIG_DIR` values interfere? S1 only
   ran them sequentially. Must be answered before M4, ideally as a two-minute test during M1.
-- Answered 2026-08-01: the SDK stream DOES surface limit data in-band, as a `rate_limit_event`
-  message (found by S3). Exact shape, fire conditions, and weekly coverage are being characterized
-  in the S3 addendum. If it carries percentages, it becomes the gauge's fresh source for whichever
-  account is running a session, with the file read for idle accounts and self-metering as floor.
+- Answered 2026-08-01: the SDK stream DOES surface limit data in-band, two ways (S3 addendum).
+  `rate_limit_event` is too thin to anchor the gauge (optional fields, one window per event, once
+  per session at flat usage); use it as a pressure interrupt when `status` leaves `allowed`. The
+  experimental usage method on `Query` is the fresh official anchor for the running account,
+  called at task boundaries and wrapped defensively since the SDK's own name says not to rely on
+  it. Watch item: both are undocumented; if either breaks in an SDK update the gauge must degrade
+  to file read plus self-metering without erroring.
 - The two accounts have different bucket shapes: work has usage credits enabled with a monthly
   limit, personal has them disabled. The cross-account gauge cannot assume one layout.
 
@@ -269,3 +275,8 @@ Append here when a design call is made during the build. Date, decision, reason,
 - 2026-08-01. Fresh cut confirmed as default cut mode with evidence, not just preference. Reason:
   S3 showed compact focus steers but does not redact, summaries can confabulate, and compaction
   cost is invisible to usage reporting.
+- 2026-08-01. Gauge source stack settled: (1) the SDK's experimental usage method for the account
+  running a session, at task boundaries, defensively wrapped; (2) `rate_limit_event` as a live
+  pressure interrupt; (3) `.claude.json` file read for idle accounts, gated on `fetchedAtMs`;
+  (4) self-metering always on as the floor and calibration substrate. Every layer degrades to the
+  next without erroring.
