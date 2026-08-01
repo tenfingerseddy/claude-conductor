@@ -476,6 +476,20 @@ different vendor, so review is the one thing that can run freely.
 
 **Morning report** goes at the top of this file, above the status line.
 
+**The hard rail fired, for real, at 11:37 UTC.** The work account hit 100% of its five-hour
+window on a six-minute-old reading, with extra-usage credits enabled, which means further work
+spends real money rather than stopping. This session runs on that account (`CLAUDE_CONFIG_DIR`
+confirmed). Kane is asleep and cannot approve crossing into paid usage, so the playbook's hard
+rail applies with nobody to override it. Action taken: no new work initiated, in-flight work
+(the Sol gate) left to finish because killing it would waste more than it saves, and a wait until
+the 12:20 UTC reset. Then the run resumes.
+
+Two things worth keeping from this. First, it is the exact behaviour Conductor exists to produce,
+performed by hand because Conductor cannot yet manage itself; the gauge, the rail and the pacing
+decision all worked, they were just executed by the architect rather than the service. Second, it
+is the strongest argument yet for M2 slice D, since a queue that paces against resets would have
+scheduled around this rather than stopping dead.
+
 **Operational lesson, learned the hard way at 
 the start of the run.** Do not `git stash` or switch
 branches while a builder is working the same tree. Doing it once pulled a running builder's
