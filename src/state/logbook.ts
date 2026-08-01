@@ -75,6 +75,35 @@ export type ConductorEvent =
       outsideLeftAlone: number;
       failures: number;
     }
+  // --- isolation (M2 slice A-prime) ------------------------------------------
+  // A task's own copy of a project. This line is also how undo finds the copy again later, which is
+  // why it carries the repo root, the branch and the worktree path and not only the task id.
+  | {
+      kind: 'workspace_created';
+      taskId: string;
+      repoRoot: string;
+      /** The commit the copy was made from. Named, so "what did this start from" is never a guess. */
+      baseCommit: string;
+      /** Where the user's HEAD pointed. Null when it was detached. Recorded, never moved. */
+      baseRef: string | null;
+      branch: string;
+      worktreePath: string;
+      /** The task cwd relative to the repo root, '/'-separated. Empty when it is the root. */
+      relPath: string;
+      workdir: string;
+      /** What the copy lacks, counted in the user's folder at creation time. */
+      modifiedTracked: number;
+      untracked: number;
+      workdirCreated: boolean;
+    }
+  // No copy was made, so no task ran. Logged as loudly as a creation: there is no fallback to
+  // running in the user's folder, so this line is the whole story of why nothing happened.
+  | { kind: 'workspace_refused'; taskId: string; cwd: string; reason: string }
+  // The task's work committed on its own branch. committed:false means the task changed nothing.
+  | { kind: 'workspace_sealed'; taskId: string; branch: string; commit: string; committed: boolean; files: number }
+  | { kind: 'workspace_seal_failed'; taskId: string; branch: string; reason: string }
+  // Undo. ok:false means the copy is still on disk and the branch was left alone.
+  | { kind: 'workspace_discarded'; taskId: string; branch: string; worktreePath: string; ok: boolean; reason?: string }
   | {
       kind: 'gauge_reading';
       account: string;
