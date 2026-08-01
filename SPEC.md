@@ -1,7 +1,10 @@
 # Conductor, a self-managing harness for Claude
 
-Working name: **Conductor**. Placeholder, rename freely. Revision 2, 2026-08-01: revision 1 plus
-the publishing posture and other-engines sections. This repo is Conductor's home.
+Working name: **Conductor**. Placeholder, rename freely. Revision 3, 2026-08-01: revision 2 plus
+the reversibility model and the permissive default, a fourth state thing (the notebook), subagent
+account routing, evidence-backed finish_task, and compact cut dropped from v1. Written after M0's
+five spikes and M1's build, so the platform claims here are measured, not assumed. This repo is
+Conductor's home.
 
 One line: a small always-on service on the laptop that runs Claude sessions through the Claude
 Agent SDK and gives Claude the three things it needs to manage itself: live numbers, rules it can
@@ -48,8 +51,19 @@ way. The intelligence stays in the model. The tool stays small.
 
 - **Give Claude eyes, rules, and memory. Do not build a boss.** Conductor never overrides Claude's
   judgment except at a few hard rails written in the policy file.
-- **Simplicity budget.** State lives in three plain things: one policy file, one log file, one
-  folder of handoff notes. Claude gets one custom tool in v1. Every feature must justify its bytes.
+- **Reversibility buys permission.** The reason to interrupt a human is that a mistake is expensive
+  to undo, so Conductor attacks the undo instead of the permission. It checkpoints the work before
+  every task, which makes almost everything inside a project folder erasable with one command.
+  Work that is reversible runs without asking and is reported afterwards. Work that is not
+  reversible stops for a human. The permissive default is earned by the checkpoint, never assumed.
+- **Scope by place, not by command.** Guessing which commands are dangerous is a losing game; an
+  adversarial review of v1 walked through the first two attempts. Inside an allowlisted project
+  folder, near-total freedom. Outside it, a hard stop regardless of trust level. Place is a
+  boundary Conductor can enforce honestly.
+- **Simplicity budget.** State lives in four plain things: one policy file, one log file, one
+  folder of handoff notes, one notebook of durable findings. Claude gets one custom tool in v1.
+  Every feature must justify its bytes, and new ones are paid for by dropping old ones: the
+  notebook was paid for by dropping compact cut.
 - **The cut point is the control point.** Because context is cut at task boundaries, every boundary
   is also the free moment to change model, effort, and account. One mechanism serves three goals.
 - **One engine, many doors.** VS Code, phone, and terminal are thin faces over the same service.
@@ -67,10 +81,12 @@ flowchart LR
         P[playbook.md\npolicy, 1 page]
         L[events.jsonl\nlogbook]
         H[handoffs/\ntask notes]
+        N[notebook.md\ndurable findings]
         D --> SDK
         D --- P
         D --- L
         D --- H
+        D --- N
     end
     VS[VS Code panel] --> D
     CLI[Terminal] --> D
@@ -109,13 +125,21 @@ sequenceDiagram
 Mechanics, all on documented SDK surface:
 
 - **The tool.** Claude gets one custom in-process tool, `finish_task`. Input: a handoff note (what
-  was done, what matters, open threads), an outcome verdict, and optional follow-up tasks for the
-  queue. Calling it is how Claude asks for the cut.
-- **The cut.** Two modes, chosen by playbook rule. **Fresh cut** (default): the service ends the
-  session and starts the next task in a new one, feeding back only the handoff note and pointers.
-  This beats compaction because Claude wrote the summary deliberately. **Compact cut**: the service
-  sends `/compact` with Claude's handoff note as the focus instructions on the resumed session,
-  for task chains that genuinely need deep shared history.
+  was done, what matters, open threads), an outcome verdict, evidence backing that verdict, and
+  optional follow-up tasks for the queue. Calling it is how Claude asks for the cut.
+- **Evidence, not claims.** A verdict of done must carry a pointer to what was run and what was
+  seen; the service rejects a bare claim and asks again. This is the "verify before claiming done"
+  rule moved out of the culture and into the mechanism, after a v1 review found twenty defects in
+  work that had already been reported as finished.
+- **The cut.** One mode in v1: **fresh cut**. The service ends the session and starts the next task
+  in a new one, feeding back only the handoff note and pointers. Claude wrote that summary
+  deliberately, which beats any automatic compaction. Compact cut was specced in revision 2 and
+  dropped in revision 3: the spike found that focus instructions steer the summary without
+  removing anything, that summaries invent details, and that compaction's own token cost is
+  invisible to usage reporting. It was a second mechanism earning its keep on nothing.
+- **The checkpoint.** Before each task in a git project, the service commits the working tree to a
+  Conductor branch. This is what makes the permissive default safe, and it gives every door a
+  one-command undo of the last task.
 - **Mid-task checkpoint.** If the gauge runs high mid-task, the injected gauge line tells Claude to
   call `finish_task` early with a checkpoint handoff. Same tool, no second mechanism.
 - **Backstop.** Auto-compact stays enabled as the emergency floor. A PreCompact hook logs every
@@ -149,9 +173,24 @@ may propose edits to. Examples of the kind of rule it holds:
 - Above 70% of the 5-hour window: subagents drop to Sonnet, effort medium; queue Fable work.
 - Fable is for design decisions, gnarly debugging, and final review. Never for file sweeps.
 - Above 60% context mid-task: checkpoint at the next natural boundary.
-- Account rotation order and what each account is reserved for.
+- Account rotation order and what each account is reserved for, and the line that separates
+  routing work to the account it belongs to from stretching one account's limits.
+- Which project folders are allowlisted, since place is the real permission boundary.
 - Hard rails the service enforces itself, not just advises: e.g. never start a Fable task above
-  85% of its window; destructive actions always require a human tap.
+  85% of its window; the irreversible set in the security section always requires a human tap.
+
+### Notebook
+
+`notebook.md`, the fourth state thing, added in revision 3. Durable findings about the world that
+outlive any one task: how the platform actually behaves, what a spike proved, what a rail must
+never vouch for, where a project keeps the thing everyone looks for. The playbook holds rules, the
+logbook holds events, handoffs hold task context; none of them hold facts, so today those facts
+live in build notes that only survive because a human keeps updating them.
+
+Claude writes entries as it learns them. Each entry is one fact and its evidence pointer, so a
+future session can trust it or re-check it. The review loop prunes the notebook the same way it
+prunes the playbook, and for the same reason: an unpruned memory becomes noise, and a page cap
+forces the ranking that makes it useful.
 
 ### Logbook
 
@@ -180,6 +219,13 @@ Named profiles passed to the SDK's agents option on every session: e.g. scout (H
 builder (Opus, medium), reviewer (Opus, high), advisor (Fable, high, rare). The playbook maps task
 types and gauge states to profiles. Claude picks per call; the registry just makes the choices
 consistent and loggable.
+
+A profile may also name an account, so subagents do not all drain whichever tank the main session
+sits on. This is the point of the plural gauge: parallel work on a full account while another
+rests. The honest line, and it belongs in the playbook rather than the code: route work to the
+account it belongs to, and use separate accounts because they are separate, never as a scheme to
+stretch one account's limits. Pacing and queueing are the legitimate levers, per the publishing
+posture.
 
 ### Account layer
 
@@ -231,8 +277,21 @@ kept alive so no capability becomes VS Code-only.
 - The phone page binds to the Tailscale address only. Nothing listens on the open internet, no
   port forwarding, no third-party relay, content never leaves the user's devices.
 - A PIN (or passkey) on the phone page as a second lock on top of device membership.
-- Approvals: the same permission model Claude Code uses, surfaced as buttons. Destructive actions
-  always stop for a tap, on every door, regardless of playbook.
+- Every door authenticates to the service with a per-daemon token, and only the door that was
+  asked may answer an approval. A page that merely reaches the local port is not a door.
+- **Threat model, stated so the rails can be judged.** Conductor defends against a hostile page
+  reaching the local service, and against the model misusing its own tools. It does not defend
+  against a hostile process already running as the user, because such a process can read the
+  official tools' credential files directly and owns the account regardless. OS user isolation is
+  the boundary there, and pretending otherwise would buy theatre instead of safety.
+- Approvals: the same permission model Claude Code uses, surfaced as buttons. What stops for a tap
+  is decided by reversibility, not by a list of scary commands. The irreversible set is short and
+  always stops, on every door, regardless of playbook or trust level: writing outside the
+  allowlisted folders, deleting what version control never saw, pushing to a remote, sending
+  anything outward, and crossing from plan usage into paid credits.
+- Interpreters are never treated as safe, whatever they point at. A session can write a script and
+  then run it, so vouching for the runner vouches for anything. Two review rounds of v1 were failed
+  on exactly this.
 - Project folders reachable from the phone are an explicit allowlist.
 - Secrets: no Anthropic credentials in the repo or the state files. Logins stay where the official
   tools store them. `ANTHROPIC_API_KEY` stays unset everywhere so subscription auth is used.
@@ -282,9 +341,10 @@ stays clearly on the safe side of that line:
    account-switcher extension reads today, the status-line JSON of a parallel Claude Code process,
    or self-metering calibrated once against the official numbers. Pick in the spike, ship with
    self-metering as the floor.
-3. **`/compact` behavior through the SDK in practice.** Verify focus instructions are honored and
-   the compact boundary is visible to the service. Fallback if flaky: fresh cut only, which is the
-   preferred mode anyway.
+3. **`/compact` behavior through the SDK in practice.** Answered by the spike: it works, focus
+   instructions are honored, and the boundary is visible four ways. Resolved by dropping the
+   feature anyway, for the reasons in the core loop section. Kept here because the finding matters
+   if compact cut is ever reconsidered.
 4. **Billing split returns.** If the separate SDK credit ships later, add it as a bucket in the
    gauge and a line in the playbook. Design assumption: buckets are plural from day one.
 5. **Windows service ergonomics.** Auto-start, keep-awake, and Tailscale bind on Windows need one
@@ -296,7 +356,8 @@ stays clearly on the safe side of that line:
 - **M1, engine (week 1):** daemon, one SDK session, `finish_task`, fresh cut, gauge line with
   context fill + self-metered usage, `events.jsonl`, minimal CLI door.
 - **M2, brain (week 2):** playbook injection and hard rails, task queue with pacing, subagent
-  registry, compact-cut mode, backstop logging.
+  registry with account routing, the notebook, task checkpoints with per-task undo, the permissive
+  default, backstop logging.
 - **M3, faces:** VS Code panel v1 (chat, gauge, queue, approvals).
 - **M4, accounts:** account layer, switcher-extension merge, cross-account gauge.
 - **M5, phone:** Tailscale page with continue, start, approve.
