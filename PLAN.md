@@ -17,8 +17,18 @@ written fallbacks, so M1 begins per D1.** Last updated 2026-08-01.
 
 ## Ratified decisions
 
-Agreed with Kane on 2026-08-01. These are settled. Changing one means changing this list and
-saying why.
+Agreed with Kane on 2026-08-01. Changing one means changing this list and saying why.
+
+**Provenance warning, added later the same day.** D1 to D12 were answers to multiple-choice
+questions an AI framed, several of them carrying a recommended option. That makes them picks
+against someone else's framing, not positions Kane stated in his own words, and the scope
+program's `DECISIONS.md` found exactly this contamination worth unwinding when it hit the same
+pattern. They are good enough to build on and they are not the same grade of evidence as a
+dictated position. Two that most deserve re-putting in plain terms, because they shape everything
+downstream: D9 (approvals, since the reversibility model in SPEC revision 3 changed the question
+underneath it) and D5 (state location, chosen before the public repo was known about). Anything
+Kane has since stated in his own words outranks the table: the permissive default and the four
+revision 3 additions are his words, not picks.
 
 | # | Decision | Choice |
 |---|---|---|
@@ -439,7 +449,17 @@ Append here when a design call is made during the build. Date, decision, reason,
   shapes shrink to bare known command names only (no paths, no .cmd/.bat/.ps1 resolution, no
   redirection, arguments checked against per-command safe-flag lists). Convenience lost is the
   price of a rail that means something.
-- 2026-08-01. First real queue content after M1 merges: the assessment program in nexwave-apps
-  (`assessment-program/VISION.md`). Blocked on Kane answering the five blocking questions in
-  `assessment-program/QUESTIONS.md`; the vision then goes to Sol per its own header before an
-  implementation plan exists.
+- 2026-08-01. First real queue content after M1 merges: the scope program in nexwave-apps, now at
+  `scope/` (the repo was reorganised; `fieldbook/` and `assessment-program/` are gone). Its
+  blocking questions are answered and it has its own VISION, PLAN, DECISIONS and PHASE0-FINDINGS.
+  It is no longer blocked on Kane. `scope/conductor-demo/` is leftover from the M1 finish line run
+  and can be deleted whenever.
+- 2026-08-01. Provenance grading adopted, prompted by the scope program's `DECISIONS.md`, which
+  found that recording menu picks and dictated positions as one flat list overstated what the
+  human had actually decided. Kane's own words outrank picks against AI framing, which outrank AI
+  recommendations, and each is marked. Applied retroactively to this file's decisions table and
+  written into SPEC revision 4 as a design principle.
+- 2026-08-01. Brain dumps are a continuous input, not a kickoff step (Kane's own words). The inbox
+  organ in SPEC revision 4 takes them: raw kept verbatim, absorbed at cut points, triaged into
+  typed items, reversals stated loudly, superseded work marked rather than deleted, order
+  preserved, and a phone dump box because most dumps happen away from the desk.

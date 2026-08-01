@@ -1,9 +1,10 @@
 # Conductor, a self-managing harness for Claude
 
-Working name: **Conductor**. Placeholder, rename freely. Revision 3, 2026-08-01: revision 2 plus
-the reversibility model and the permissive default, a fourth state thing (the notebook), subagent
-account routing, evidence-backed finish_task, and compact cut dropped from v1. Written after M0's
-five spikes and M1's build, so the platform claims here are measured, not assumed. This repo is
+Working name: **Conductor**. Placeholder, rename freely. Revision 4, 2026-08-01: revision 3 plus
+the inbox, continuous brain dumps, and provenance grading. Revision 3 the same day added the
+reversibility model and the permissive default, a fourth state thing (the notebook), subagent
+account routing, evidence-backed finish_task, and dropped compact cut. Written after M0's five
+spikes and M1's build, so the platform claims here are measured, not assumed. This repo is
 Conductor's home.
 
 One line: a small always-on service on the laptop that runs Claude sessions through the Claude
@@ -56,6 +57,11 @@ way. The intelligence stays in the model. The tool stays small.
   every task, which makes almost everything inside a project folder erasable with one command.
   Work that is reversible runs without asking and is reported afterwards. Work that is not
   reversible stops for a human. The permissive default is earned by the checkpoint, never assumed.
+- **Provenance outranks convenience.** What the human said in their own words is the strongest
+  input. A pick from options an AI framed is weaker, because the framing is the AI's; such picks
+  are marked and re-put later in plain terms. An AI recommendation is marked as one and never
+  quietly promoted into the human's position. Losing this distinction is how a plan ends up
+  reflecting the assistant's assumptions while everyone believes it reflects the human's.
 - **Scope by place, not by command.** Guessing which commands are dangerous is a losing game; an
   adversarial review of v1 walked through the first two attempts. Inside an allowlisted project
   folder, near-total freedom. Outside it, a hard stop regardless of trust level. Place is a
@@ -82,11 +88,13 @@ flowchart LR
         L[events.jsonl\nlogbook]
         H[handoffs/\ntask notes]
         N[notebook.md\ndurable findings]
+        I[inbox/\nraw brain dumps]
         D --> SDK
         D --- P
         D --- L
         D --- H
         D --- N
+        D --- I
     end
     VS[VS Code panel] --> D
     CLI[Terminal] --> D
@@ -179,6 +187,34 @@ may propose edits to. Examples of the kind of rule it holds:
 - Hard rails the service enforces itself, not just advises: e.g. never start a Fable task above
   85% of its window; the irreversible set in the security section always requires a human tap.
 
+### Inbox
+
+`inbox/`, where raw brain dumps land. The working method this serves: the human dictates a dump
+whenever a thought arrives, and keeps doing it for the life of the project. Dumps are the richest
+input Conductor gets, because they are the human's own framing rather than a pick from a menu an
+AI wrote. So they are treated as source, not as chatter.
+
+Rules that make continuous dumping safe:
+
+- **Raw is kept forever, verbatim.** A dump file is never edited. Everything derived from it,
+  vision text, decisions, tasks, points back at the dump it came from. Traceability is what makes
+  provenance grading enforceable rather than aspirational.
+- **Absorbed at cut points.** A new dump is read at the next task boundary, never mid-task. The
+  cut point is already the moment model, effort and account can change; new direction is the
+  fourth thing it carries. No new mechanism.
+- **Triaged into typed items.** One pass over a dump splits it into new intent, an answer to an
+  open question, a reversal of a previous decision, a constraint, a durable fact for the notebook,
+  or noise. Each type has one place it goes. Nothing is left as prose to be re-read later.
+- **Reversals are loud.** A dump that contradicts a ratified decision never quietly edits it. It
+  produces a stated reversal: which decision, what it unwinds, what work is now superseded. This
+  is what lets the human dump freely without fear of silently breaking agreed direction.
+- **Work in flight is superseded, not deleted.** A queued task the dump invalidates is marked with
+  the reason and kept. Running work checkpoints at its boundary and is re-briefed.
+- **Order is preserved.** Five dumps overnight process oldest first, and a later one may supersede
+  an earlier one. Timestamps are the record.
+- **Capture happens away from the laptop.** Most dumps will not be typed at a desk, so the phone
+  door takes them from day one, and the inbox accepts a file dropped from anywhere.
+
 ### Notebook
 
 `notebook.md`, the fourth state thing, added in revision 3. Durable findings about the world that
@@ -264,8 +300,9 @@ item shows the two most urgent numbers. Later: diffs, session history browser, l
 
 A small mobile web page served only on the Tailscale interface. V1 contents: gauge, session list,
 continue a session (read latest turns, send a message, approve or deny), start a new session
-(pick from an allowlist of project folders, pick account, type the task), and the task queue.
-Push-style nudges can come later; v1 is pull only.
+(pick from an allowlist of project folders, pick account, type the task), the task queue, and a
+dump box that drops dictated notes straight into the inbox. Push-style nudges can come later; v1
+is pull only.
 
 ### Terminal
 
@@ -356,8 +393,8 @@ stays clearly on the safe side of that line:
 - **M1, engine (week 1):** daemon, one SDK session, `finish_task`, fresh cut, gauge line with
   context fill + self-metered usage, `events.jsonl`, minimal CLI door.
 - **M2, brain (week 2):** playbook injection and hard rails, task queue with pacing, subagent
-  registry with account routing, the notebook, task checkpoints with per-task undo, the permissive
-  default, backstop logging.
+  registry with account routing, the notebook, the inbox with dump triage and loud reversals, task
+  checkpoints with per-task undo, the permissive default, backstop logging.
 - **M3, faces:** VS Code panel v1 (chat, gauge, queue, approvals).
 - **M4, accounts:** account layer, switcher-extension merge, cross-account gauge.
 - **M5, phone:** Tailscale page with continue, start, approve.
