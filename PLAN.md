@@ -306,7 +306,22 @@ src/
 ### Review and land
 
 - [x] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
-- [~] Findings resolved or explicitly parked with a reason. Fix slice landed: 18 of 20 fixed and
+- [x] Sol confirmation pass: **passed**. `docs/notes/sol-review-m1-confirm.md`. Findings 1 and 3
+      confirmed fixed on every reachable path, finding 2 closed outright, no regression from any
+      of the three fixes. Two new findings, neither blocking: (A, medium) the managed policy tier
+      is read regardless of `settingSources`, so an admin-controlled hook could still launch a
+      process, verified in the installed SDK types; parked under the v1 threat model because
+      writing that tier needs administrator rights, which is more authority than the same-user
+      attacker already excluded, and this machine has zero managed sources. Our own findings file
+      overclaimed here and has been corrected. (B, low) a mutable `task.trust` getter could slip
+      past the refusal; judged a false positive since tasks arrive as plain JSON and the only
+      caller able to install such a getter is in-repo code that could bypass the engine entirely.
+      A one-line snapshot is cheap hygiene and is booked for M2 slice B. Sol also noted the tool
+      matcher is still not exhaustive but declined to report it, since `allowedTools` and
+      `strictMcpConfig` leave no tool able to reach the gaps; recorded, because that safety comes
+      from an empty tool surface rather than a complete matcher, and M2 must not widen the surface
+      without revisiting it.
+- [x] Findings resolved or explicitly parked with a reason. Fix slice landed: 18 of 20 fixed and
       mechanically demonstrated, 2 parked (handoff disk recovery and follow-up queueing, both
       belong to M2's durable queue), none contested. Closure table with evidence per finding in
       `docs/notes/m1-fixslice-findings.md`. Box closes when the Sol re-check passes.
@@ -318,8 +333,38 @@ src/
       **failed again**, four real findings, three reaching execution unasked. Raw output:
       `docs/notes/sol-review-m1-final.md`. Root cause named: the classifier judges a string the
       shell has not finished transforming.
-- [ ] Rail simplification: empty the vouched set, refuse autonomous trust at the gate, keep
+- [x] Rail simplification: empty the vouched set, refuse autonomous trust at the gate, keep
       structured tools flowing. Closes the finding class by construction rather than by patching.
+      Landed: 285 lines deleted from the classifier, 0 of 24 probe strings vouched, all nine of
+      Sol's bypasses tap, autonomous refused at both gates with no session started. Evidence in
+      `docs/notes/m1-railsimplify-findings.md`.
+- [x] Sol gate follow-up, all three closed with evidence (commit `161492c`,
+      `docs/notes/m1-gatefix-findings.md`). The merge blocker was demonstrated rather than argued:
+      a `.claude/settings.json` with SessionStart and UserPromptSubmit hooks plus a `.mcp.json`
+      stdio server were planted in a task folder, all three writing marker files. A control raw
+      SDK query on the same folder fired all three before the model spoke; the real Conductor loop
+      fired none, and the marker file does not exist. The tool matcher now catches every name Sol
+      named plus camelCase, and convicts on argument shape when the name is innocent; unreadable
+      arguments count as risky. `runSession` refuses autonomous trust itself with zero SDK
+      messages, so the HTTP and task-loop gates became defence in depth rather than the only
+      guards. The overclaim in the previous findings file is marked corrected.
+      Accepted tradeoff, recorded: `settingSources: []` means a target project's own CLAUDE.md no
+      longer loads, which SPEC's architecture section expects a session to have. Taken knowingly
+      for M1 because it also closes the leak where a parent CLAUDE.md and the account email flowed
+      into every fresh session. The permanent policy is an M2 open question, not decided here.
+- [x] Sol gate. **Failed**, narrowly, and the deletion itself held: no
+      shell-shaped call got through and no default-allow branch exists. The hole is the SDK
+      configuration around the rail, not the rail. Three findings in
+      `docs/notes/sol-review-m1-gate.md`: (1) merge-blocking, the session is built without
+      `settingSources: []` and `strictMcpConfig: true`, so it loads whatever settings and MCP
+      config the task folder or user profile carries, and a settings-file hook is a process launch
+      rather than a tool call, so neither rail layer ever sees it; (2) the shell-tool name match
+      misses `run_script`, `python`, `spawn`, `script`, not an escape today but the findings note
+      overclaimed that it could not be; (3) `runSession` is exported without the trust refusal, so
+      in-process code could start an autonomous session, engine boundary only.
+      Neat consequence: finding 1's fix is also the fix for the earlier wrinkle where a parent
+      `CLAUDE.md` and Kane's email address flowed into every fresh session. One change, three
+      problems.
 - [ ] Merge to main, with autonomous trust disabled and the permissive default deferred to M2.
 - Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
   and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
@@ -350,6 +395,78 @@ files; no git ran there. Full transcripts and events trail:
 `docs/notes/m1-finishline-findings.md`. Four wrinkles captured, not patched, listed under open
 questions; they go to the Sol review and one fix slice.
 
+## M2, brain
+
+Written 2026-08-01 during the overnight run, before any M2 code. Order matters here: each slice
+below is a prerequisite of the permissive default, which is the milestone's actual goal. M1 ships
+tap-heavy and unattended-incapable; M2 is what earns the freedom back honestly.
+
+### Slice A, checkpoints and undo (the enabler)
+
+Nothing else in M2 is safe without this, so it goes first.
+
+- [ ] Before each task in a git project, commit the working tree to a Conductor branch. Never to
+      the user's branch, never a push.
+- [ ] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
+- [ ] `undo last task` on every door: restore the tree to the task's checkpoint ref.
+- [ ] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
+      refusal beats a checkpoint that does not exist.
+- Finish line: a task makes a mess, one command puts it back exactly, proven on a scratch repo
+  with a dirty tree beforehand.
+
+### Slice B, place enforcement and shell-free execution (the rail rebuild)
+
+The thing three review rounds proved cannot be done by reading strings.
+
+- [ ] Run commands as argument vectors with no shell, so nothing transforms the vector after the
+      rail inspects it. This dissolves the bug class rather than patching it.
+- [ ] Enforce place at the filesystem: resolve real paths and compare against the allowlist, after
+      symlink resolution, rather than inspecting command text.
+- [ ] Only then, re-introduce a vouched-safe set, argv-shaped and small, with the interpreter rule
+      from the decisions log still binding.
+- [ ] Sol reviews this before it lands, with the standing brief that three previous versions failed.
+- Finish line: every one of Sol's nine bypasses is inexpressible rather than merely blocked, and
+  ordinary reads run without taps.
+
+### Slice C, the permissive default
+
+Only after A and B.
+
+- [ ] Reversible work runs without asking and is reported afterwards.
+- [ ] The irreversible set from SPEC's security section always stops: writing outside allowlisted
+      folders, deleting what version control never saw, pushing to a remote, sending anything
+      outward, crossing into paid credits.
+- [ ] Autonomous trust is re-enabled at the gate, gated on A and B being present.
+- Finish line: an unattended queue runs a real chain overnight, and the morning shows what it did
+  with an undo available for every step.
+
+### Slice D, the queue with pacing
+
+- [ ] Durable ordered queue on disk, surviving a daemon restart (closes the two parked Sol
+      findings about handoff recovery and follow-up queueing).
+- [ ] `finish_task` follow-ups land in it automatically.
+- [ ] Scheduling reads the gauge and the playbook: heavy work waits for resets, light work fills
+      remaining headroom, and the paid-credit boundary is a hard stop.
+- Finish line: a queue with a heavy task and a light one paces correctly against a real window.
+
+### Slice E, the inbox
+
+- [ ] `inbox/` accepts dropped files, raw kept verbatim, order by timestamp.
+- [ ] Triage at cut points into typed items: intent, answer, reversal, constraint, notebook fact,
+      noise.
+- [ ] Reversals are stated loudly and mark superseded work rather than deleting it.
+- [ ] Provenance grading recorded per item, per SPEC revision 4.
+- Finish line: two dumps, the second contradicting the first, produce a stated reversal and a
+  superseded task rather than a silent edit.
+
+### Slice F, notebook, playbook enforcement, subagent registry
+
+- [ ] `notebook.md` written by Claude, pruned by the review loop, page-capped.
+- [ ] Playbook hard rails enforced by the service, not just advised.
+- [ ] Subagent registry with per-profile model, effort, and account routing, plus the honesty line
+      about legitimate account use in the playbook.
+- Finish line: a rail in the playbook demonstrably stops the service, not just the model.
+
 ## Parked for later milestones
 
 Written down so they do not leak into M1.
@@ -360,6 +477,72 @@ Written down so they do not leak into M1.
 - M5: Tailscale phone page.
 - M6: scheduled review task that edits the playbook with evidence.
 - M7: external runners, headless Codex first, cross-vendor gauge buckets.
+
+## Overnight run, 2026-08-01
+
+Kane asleep, working autonomously. Assumptions stated here so they can be overturned in the
+morning rather than discovered. This is the assumption register pattern from SPEC revision 4,
+used on its first real night.
+
+**Pacing, and why it shapes the plan.** Gauge read at the start of the run: work account 77% of
+its 5-hour window on a 34-minute-old reading, weekly 53%. That account has extra-usage credits
+enabled, so overrunning spends real money, and the playbook's hard rail says never cross that
+line without a human tap. Kane cannot tap. So the night is paced deliberately: sequential
+builders, no fan-out, heavy work held until after a window reset, and the cheap architect work
+done in the main thread meanwhile. Sol reviews are free in Claude terms because Codex is a
+different vendor, so review is the one thing that can run freely.
+
+**Order of work:**
+
+1. Finish the rail simplification (running), verify every one of Sol's nine bypasses taps.
+2. One Sol pass on the simplified rail. Cheap to review because it is mostly a deletion.
+3. If clean, merge `feat/m1-engine` to main and close M1.
+4. Write the M2 plan properly in the main thread: slices, briefs, finish lines. Costs almost
+   nothing and is the highest-value thing I can do while pacing.
+5. Re-read the gauge. Only if the 5-hour window has reset, start one M2 foundation builder.
+
+**Assumptions, overturnable:**
+
+- A1. Merging M1 once the simplified rail passes Sol and the demo re-runs is within the autonomy
+  Kane granted. He approved merge-after-review-and-demonstrated-run explicitly.
+- A2. Overnight building is limited to work that cannot loosen safety: the durable task queue,
+  checkpoints, the notebook, the inbox. Nothing that widens permissions lands while he sleeps.
+- A3. The rail rebuild (argv-array execution, filesystem place enforcement) and the permissive
+  default are designed overnight but not built and not merged. They are the things that could
+  hurt him, so they wait for his ratification.
+- A4. Nothing in `nexwave-apps` is touched. The scope program is unblocked but it has its own
+  plan and starting it unbriefed overnight is not what autonomy means.
+- A5. The two decisions flagged for re-putting (D9 approvals, D5 state location) stay parked.
+  They need Kane's own words, and guessing them would be the exact provenance failure the spec
+  just warned about.
+- A6. If a build fails twice on the same problem, stop and write it up rather than trying a third
+  variation. Today's rail cost three rounds before the design changed; the lesson is cheap to
+  reuse.
+
+**Morning report** goes at the top of this file, above the status line.
+
+**The hard rail fired, for real, at 11:37 UTC.** The work account hit 100% of its five-hour
+window on a six-minute-old reading, with extra-usage credits enabled, which means further work
+spends real money rather than stopping. This session runs on that account (`CLAUDE_CONFIG_DIR`
+confirmed). Kane is asleep and cannot approve crossing into paid usage, so the playbook's hard
+rail applies with nobody to override it. Action taken: no new work initiated, in-flight work
+(the Sol gate) left to finish because killing it would waste more than it saves, and a wait until
+the 12:20 UTC reset. Then the run resumes.
+
+Two things worth keeping from this. First, it is the exact behaviour Conductor exists to produce,
+performed by hand because Conductor cannot yet manage itself; the gauge, the rail and the pacing
+decision all worked, they were just executed by the architect rather than the service. Second, it
+is the strongest argument yet for M2 slice D, since a queue that paces against resets would have
+scheduled around this rather than stopping dead.
+
+**Operational lesson, learned the hard way at 
+the start of the run.** Do not `git stash` or switch
+branches while a builder is working the same tree. Doing it once pulled a running builder's
+in-progress edits out from under it and left a conflicted index on main. Nothing was lost, the
+stash was retained and everything was restored, but it could have corrupted a build. New rule for
+the architect: while a builder is active, commit documentation on the working branch and let it
+reach main at merge time. Never switch branches to tidy up. This belongs in the notebook once the
+notebook exists, which is a fair argument for building it early.
 
 ## Open questions
 
@@ -422,6 +605,13 @@ Append here when a design call is made during the build. Date, decision, reason,
 - 2026-08-01. Fresh cut confirmed as default cut mode with evidence, not just preference. Reason:
   S3 showed compact focus steers but does not redact, summaries can confabulate, and compaction
   cost is invisible to usage reporting.
+- 2026-08-01. Gauge freshness has two tests, not one, learned live during the overnight pause. A
+  reading is stale if `fetchedAtMs` is old, and separately a reading is **expired** if its own
+  `resets_at` has passed, because it then describes a window that no longer exists. At 12:22 UTC
+  the work account's file still read 100% from a 51-minute-old fetch whose reset was 12:20, so
+  the honest reading was "that window is gone, assume it rolled over, fall back to self-metering
+  from the reset moment". A gauge that checked only fetch age would have reported a full tank as
+  empty and stopped work for hours. Both tests ship in M2's gauge work.
 - 2026-08-01. Gauge source stack settled: (1) the SDK's experimental usage method for the account
   running a session, at task boundaries, defensively wrapped; (2) `rate_limit_event` as a live
   pressure interrupt; (3) `.claude.json` file read for idle accounts, gated on `fetchedAtMs`;
