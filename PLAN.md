@@ -313,9 +313,14 @@ src/
 - [x] Sol re-check of the security fixes (one pass, diff-focused). **Failed**, eight findings,
       only one pass 1 item closed on its own terms. Raw output and triage:
       `docs/notes/sol-review-m1-recheck.md`. Merge blocked; fix round 2 below.
-- [ ] Fix round 2: close the re-check findings under the v1 threat model, then a final Sol pass
-      on the classifier alone.
-- [ ] Merge to main.
+- [x] Fix round 2: close the re-check findings under the v1 threat model, then a final Sol pass
+      on the classifier alone. Round 2 fixed five of eight and parked three; the final Sol pass
+      **failed again**, four real findings, three reaching execution unasked. Raw output:
+      `docs/notes/sol-review-m1-final.md`. Root cause named: the classifier judges a string the
+      shell has not finished transforming.
+- [ ] Rail simplification: empty the vouched set, refuse autonomous trust at the gate, keep
+      structured tools flowing. Closes the finding class by construction rather than by patching.
+- [ ] Merge to main, with autonomous trust disabled and the permissive default deferred to M2.
 - Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
   and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
   none judged false positive, one already known. The serious five: (1) the WS/HTTP channel has no
@@ -443,8 +448,24 @@ Append here when a design call is made during the build. Date, decision, reason,
   Conductor does; OS-level user isolation is the real boundary there. Sol's token-hardening
   findings that assume a same-user attacker (token file readable, hard links, icacls fail-open)
   are parked under this call, revisit if Conductor ever runs multi-user.
+- 2026-08-01. **Shell strings are not classifiable, so M1 stops trying.** Third architect call,
+  after Sol failed the rail three times for one repeated reason: the classifier judges a string
+  that bash then transforms further (adjacent quoted fragments joined into one word, brace
+  expansion, alias and path resolution). Each round closed the named holes and the next round
+  found new ones through the same door. So the vouched-safe set for shell commands becomes empty:
+  every shell call taps in attended mode, and autonomous trust is refused at the gate until M2.
+  Structured tools (Read, Write, Edit, Glob, Grep) never touch a shell, so their path scoping is
+  sound and they keep running freely. This is a deliberate usability regression, `git status` now
+  taps, bought with the only thing that actually closes the class of bug.
+- 2026-08-01. The permissive default is deferred to M2 by dependency, not by loss of nerve. It
+  rests on checkpoints, place enforcement and shell-free execution, none of which exist yet.
+  Making autonomous trust safe in M1, before the machinery that earns it, was building the hard
+  half first. M2 rebuilds it properly: argv-array execution with no shell re-parsing (sound to
+  classify, because nothing transforms the vector afterwards), filesystem-level place enforcement
+  rather than string inspection, and checkpoint-before-task so reversible work needs no tap.
 - 2026-08-01. Interpreters are never vouched safe, no exceptions (architect call closing the
-  re-check's worst hole). `node x.js`, `python`, `deno`, anything that executes a file the
+  re-check's worst hole; superseded in M1 by the empty vouched set above, still binding for M2's
+  rebuild). `node x.js`, `python`, `deno`, anything that executes a file the
   session can write, is always risky: tap in attended, denied in autonomous. Vouched-safe shell
   shapes shrink to bare known command names only (no paths, no .cmd/.bat/.ps1 resolution, no
   redirection, arguments checked against per-command safe-flag lists). Convenience lost is the
