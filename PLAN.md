@@ -296,7 +296,11 @@ src/
 ### Review and land
 
 - [x] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
-- [ ] Findings resolved or explicitly parked with a reason.
+- [~] Findings resolved or explicitly parked with a reason. Fix slice landed: 18 of 20 fixed and
+      mechanically demonstrated, 2 parked (handoff disk recovery and follow-up queueing, both
+      belong to M2's durable queue), none contested. Closure table with evidence per finding in
+      `docs/notes/m1-fixslice-findings.md`. Box closes when the Sol re-check passes.
+- [ ] Sol re-check of the security fixes (one pass, diff-focused).
 - [ ] Merge to main.
 - Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
   and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
@@ -362,7 +366,13 @@ Things not settled. Add to this list rather than guessing.
   fully honest; (3) task 2 credited a CLAUDE.md above its cwd, so a fresh cut is not a clean
   room, parent CLAUDE.md files flow in (platform behavior; document it, decide if the playbook
   should mention it); (4) `daemon_stop` never logs because Windows cannot deliver SIGINT to the
-  child, needs a Windows-appropriate shutdown path.
+  child, needs a Windows-appropriate shutdown path. Update: 1 and 4 fixed in the fix slice; 2
+  documented in the fix-slice findings; 3 investigated and found worse than expected, see next.
+- The platform injects the logged-in account's email address into every session prompt, and a
+  parent CLAUDE.md reaches a fresh session verbatim. Conductor keeps identities out of its own
+  state and the platform puts one in the prompt anyway. Needs an explicit `settingSources`
+  decision in M2: which setting sources a Conductor session loads, balancing clean cuts against
+  genuinely wanted project CLAUDE.md files. Conductor must never log prompt text in the meantime.
 - Follow-up tasks from `finish_task` are recorded but not auto-queued; the carry lives inside one
   `runTasks` call. Known M1 shape; the real queue is M2's first job.
 - Mid-task gauge refresh. The spec says the gauge line is injected every turn; the documented
