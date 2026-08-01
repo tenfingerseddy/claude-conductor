@@ -30,6 +30,21 @@ reading can be recent and still describe a window that has already reset, and ch
 would have idled Conductor for hours on a full tank. And switching branches while a builder is
 working corrupts its tree, which is why documentation now lands on the working branch.
 
+**Second half of the night: M2 slice A, checkpoints and undo.** Built, reviewed, found unsafe,
+fixed, and deliberately left unmerged. Sol raised fifteen findings and its verdict was that slice
+A did not yet justify the permissive default. The deepest was that undo could not tell task output
+from work a human did afterwards, so it would have overwritten your later edits while calling them
+Claude's mess. Fixed with a second snapshot at task end, which makes provenance knowable instead
+of guessed, and proven with reproductions that fail on the old code and pass on the new. Two
+findings are carried open in writing rather than quietly closed, and one safety path (symlinks)
+cannot be tested on this account at all, which the notes say plainly.
+
+**Where the night stopped, and why.** The usage reading went stale at 89 minutes, and SDK sessions
+never refresh it, so the honest position was that headroom on the paid-credit account was unknown.
+Roughly 620k tokens of subagent work had run since the reset. Rather than guess while you slept, I
+stopped launching work and wrote everything up. Nothing is half-finished; slice A sits complete on
+its branch waiting for a decision.
+
 **Waiting on you, nothing urgent.**
 
 - Two decisions deserve re-putting in your own words rather than as picks from my menu: approvals
@@ -38,6 +53,14 @@ working corrupts its tree, which is why documentation now lands on the working b
 - `scope/conductor-demo/` in nexwave-apps is leftover from the finish-line run and can be deleted.
 - M2 is planned as six slices below, ordered so the permissive default is earned rather than
   assumed. Slice A is checkpoints, which is the prerequisite for everything you asked for.
+- Slice A is on `feat/m2-checkpoints` and ready for your call: merge it as is, with the two
+  carried findings and the untested symlink path recorded, or hold it until finding 4 is fixed and
+  Sol has passed the whole slice. My recommendation is the latter, because the permissive default
+  is the thing this buys and it should not rest on a net with a known open seam.
+- Worth knowing before slice C: reversibility currently has three stated holes. Ignored files are
+  outside the net, a file whose bytes disagree with its own `.gitattributes` comes back converted,
+  and symlink handling has never executed. Each needs fixing or accepting in writing before
+  permission gets cheap, because "reversible" is the entire argument for it.
 
 
 Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says what we are building
@@ -493,9 +516,29 @@ Nothing else in M2 is safe without this, so it goes first.
   make. Five more are real limits rather than bugs (index and HEAD state, `.gitattributes` silent
   non-detection, submodules, symlink referents, the non-atomic scan) and the limits list reads as
   exhaustive at two entries when it is not. One false positive.
-  Fix round in flight. Design direction given: a post-image snapshot at task finish makes
-  provenance knowable instead of inferred, so undo touches only the diff from checkpoint to
-  post-image and never silently overwrites anything changed since.
+  **Fix round landed**, `docs/notes/m2-sliceA-fix-findings.md`. All four blockers closed, each
+  with a reproduction run against a detached worktree of the old code and against the new: 13 of
+  20 checks fail before, 0 after. Provenance now comes from a post-image commit at task end, so
+  checkpoint to post-image is the task's work and post-image to now is somebody else's; a human
+  edit, a human-created file and a human re-edit of a task-touched file all survive undo untouched
+  and are named in the preview as held back. No post-image means provenance is unknown and the
+  blanket undo is refused rather than guessed. Consent is bound: preview returns a plan id plus a
+  hash, the daemon applies the stored plan, and blind confirm, mismatched hash and replay are all
+  rejected. Deletes run before restores with case collisions named. The ignore set is captured at
+  checkpoint time as a pinned blob and read back verbatim. Slice A's finish line re-ran whole and
+  still passes.
+- **Two findings carried open, honestly, not closed.** Sol's finding 4, an inherited `GIT_DIR` in
+  the child environment, is real and is the first task when work resumes: a small change to
+  `gitEnv`, and it deserves its own review because getting it wrong points the plumbing at the
+  wrong repository. Sol's finding 9b, a junction swap race, is an **architect call: parked under
+  the v1 threat model.** Swapping a directory junction underneath a running operation requires a
+  hostile process already executing as Kane, which is the attacker the threat model explicitly
+  excludes, and that process could corrupt the repository directly without involving Conductor.
+  Recorded rather than fixed, consistent with the three token findings parked on the same ground.
+- Symlink detection exists but is **unverified**: this account cannot create a symlink on this
+  host (`EPERM`), so the code path has never run. The findings say so rather than implying
+  coverage. It needs verifying on a machine or account that can, before anything relies on it.
+- Still unmerged and correctly so. Next: fix finding 4, then one Sol pass over the whole slice.
 - Notebook fact from this review: the codex read-only sandbox cannot launch a process on this
   host, so Sol's first run read nothing and correctly refused to review rather than invent
   findings. The workaround is to inline the files, line-numbered, in the brief. Worth knowing
