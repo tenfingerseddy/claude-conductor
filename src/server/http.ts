@@ -418,9 +418,13 @@ function statusFor(run: TaskRun): QueuedTask['status'] {
 
 /** Boots the listener. Rejects, loudly, if the loopback bind fails. */
 export async function startDaemon(config: Config = loadConfig(), options: DaemonOptions = {}): Promise<DaemonHandle> {
-  // Fresh every start, so a token captured from a previous daemon is dead the moment this one boots.
-  const token = mintDaemonToken(config);
-  const daemon = new Daemon(config, token);
+  // Bind first, mint second. Sol's re-check finding 8: minting before the bind meant a second
+  // daemon started against the same state root overwrote the live daemon's token file and then
+  // failed to bind, leaving the running daemon holding a secret no door could read any more. The
+  // listener is the thing that can fail, so nothing that a live daemon depends on is touched until
+  // it has succeeded. Handlers below close over `daemon`, which is assigned before listen resolves
+  // and therefore before any request can arrive.
+  let daemon!: Daemon;
   const port = serverPort();
   const server = createServer((req, res) => void handle(daemon, options, req, res));
   const wss = new WebSocketServer({ noServer: true });
@@ -454,6 +458,12 @@ export async function startDaemon(config: Config = loadConfig(), options: Daemon
     // One address, named explicitly. Omitting host would listen on every interface.
     server.listen({ host: BIND_HOST, port }, resolve);
   });
+
+  // The bind held, so this process is the daemon and may take the token file. Fresh every start, so
+  // a token captured from a previous daemon is dead the moment this one boots. This runs in the
+  // microtask that follows the listen callback, before Node can dispatch a connection event, so no
+  // handler can see `daemon` unassigned.
+  daemon = new Daemon(config, mintDaemonToken(config));
 
   return {
     port,

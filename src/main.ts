@@ -5,10 +5,9 @@
 // the note it wrote to the next task. The list is a plain array on purpose. The real queue, with
 // pacing and playbook rules deciding what runs when, is M2.
 
-import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, usableAccounts, type Config } from './config.ts';
+import { loadConfig, resolveAccount, usableAccounts, type Config } from './config.ts';
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
 import { Gauge } from './engine/gauge.ts';
@@ -74,9 +73,13 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
 
   try {
     for (const task of claimed) {
-      const account = config.accounts.find((a) => a.name === task.account);
-      if (!account || account.placeholder || !existsSync(account.configDir)) {
-        const problem = `account "${task.account}" is not configured in "${config.configFilePath}"`;
+      // The execution path resolves accounts through the same validation the listing path uses,
+      // and does not re-check placeholder and existence itself. Sol's re-check finding 7: the old
+      // copy of the rules here missed the repository guard, so an account holding a login inside a
+      // git checkout was hidden from every list and still executed when a task named it.
+      const account = resolveAccount(config, task.account);
+      if (!account) {
+        const problem = `account "${task.account}" is not usable; check "${config.configFilePath}"`;
         const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: problem };
         runs.push(blocked);
         logTaskFinish(config, task.id, 'blocked', null, null, {});

@@ -101,19 +101,45 @@ const ELEVATION_COMMAND = /\b(sudo|doas|runas|takeown|icacls|Start-Process\b[^\n
 // Tool inputs that name a path. Anything outside the task's cwd needs a tap even when autonomous.
 const PATH_FIELDS = ['file_path', 'path', 'notebook_path', 'edit_file_path'];
 
-// Environment variable names that look like a secret. The daemon's own environment is inherited by
-// every session, and Sol's pass 1 showed one unflagged command is enough to write GITHUB_TOKEN into
-// a repo. Golden rule 1 only ever named the billing keys; third-party credentials are the same
-// problem wearing a different name.
+// The child environment scrub. The daemon's own environment is inherited by every session, and
+// Sol's pass 1 showed one unflagged command is enough to write GITHUB_TOKEN into a repo. Golden
+// rule 1 only ever named the billing keys; third-party credentials are the same problem wearing a
+// different name.
 //
-// Deliberately a deny-pattern rather than an allowlist: an allowlist of environment variables
-// breaks the tools a task legitimately needs (proxies, per-language paths, Windows' own dozens) and
-// would be discovered as breakage rather than as safety. The named shapes Sol raised are all
-// covered. A real allowlist belongs with M2's sandboxing work.
-const SECRET_ENV_NAME = /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIALS?|AUTH|APIKEY|PAT|SESSION)($|_)|(APIKEY|ACCESSKEY|PRIVATEKEY)/i;
+// Two mechanisms on purpose. First a pattern on the variable NAME, because the shapes credentials
+// take are more predictable than the list of products that issue them: anything carrying KEY,
+// TOKEN, SECRET, PASSWORD, CREDENTIAL, AUTH or a connection string goes, without anyone having to
+// have heard of the tool. Second a named list, because Sol's re-check finding 5 named real
+// variables no pattern can see: DATABASE_URL and MYSQL_PWD are secrets that do not say so, and
+// KUBECONFIG, DOCKER_CONFIG and AWS_SHARED_CREDENTIALS_FILE are pointers rather than secrets.
+// Dropping a pointer does not remove the credential from disk. It stops a redirected pointer being
+// read back out of the environment, and it stops the many of these that embed their own password
+// (DATABASE_URL, REDIS_URL, AMQP_URL) leaking as plain text.
+//
+// Still a denylist rather than an allowlist, and that is still a deliberate compromise: an
+// allowlist of environment variables breaks the tools a task legitimately needs (proxies,
+// per-language paths, Windows' own dozens) and would be discovered as breakage rather than as
+// safety. A real allowlist belongs with M2's sandboxing work.
+const SECRET_ENV_NAME =
+  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|CREDENTIALS?|CREDS|AUTH|APIKEY|PAT|SESSION|COOKIE|SIGNATURE|PASSPHRASE)($|_)|_PWD($|_)|(APIKEY|ACCESSKEY|PRIVATEKEY|CONNECTIONSTRING|CONNSTR)/i;
 
-// Names that must survive the scrub even though they trip the pattern above.
-const ENV_KEEP = new Set(['SESSIONNAME', 'CLAUDE_CONFIG_DIR', 'PATH', 'PATHEXT']);
+// The names the pattern cannot see. Sol's finding 5 list, plus its obvious kin.
+const SECRET_ENV_EXACT = new Set([
+  'PGPASSWORD', 'PGPASSFILE', 'PGSERVICEFILE', 'MYSQL_PWD', 'MYSQL_HOME',
+  'DATABASE_URL', 'DATABASE_URI', 'REDIS_URL', 'MONGODB_URI', 'MONGO_URL', 'AMQP_URL',
+  'CELERY_BROKER_URL', 'SENTRY_DSN', 'KUBECONFIG', 'DOCKER_CONFIG', 'DOCKER_AUTH_CONFIG',
+  'AZURE_CONFIG_DIR', 'CLOUDSDK_CONFIG', 'GOOGLE_APPLICATION_CREDENTIALS',
+  'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AWS_PROFILE', 'AWS_WEB_IDENTITY_TOKEN_FILE',
+  'VAULT_ADDR', 'NETRC', 'GNUPGHOME', 'SSH_AUTH_SOCK', 'GIT_ASKPASS', 'SSH_ASKPASS',
+  'NPM_CONFIG_USERCONFIG', 'GH_CONFIG_DIR',
+]);
+
+// Names that survive the scrub, each for a stated reason, because a keep entry is a hole if it is
+// wrong. PATH and PATHEXT: without them nothing the session runs can be found at all, and a path is
+// not a credential. CLAUDE_CONFIG_DIR: this is the account mechanism and the runner overwrites it
+// on the next line anyway. SESSIONNAME: Windows' name for the console session ("Console"), not a
+// secret, and some tooling reads it to decide whether it has a terminal.
+const ENV_KEEP = new Set(['PATH', 'PATHEXT', 'CLAUDE_CONFIG_DIR', 'SESSIONNAME']);
 
 // Long enough for the finish_task tool result to reach the model, short enough that the cut is
 // the next thing that happens.
@@ -483,11 +509,12 @@ async function askApproval(
 export function childEnv(configDir: string): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {};
   for (const [name, value] of Object.entries(process.env)) {
-    if (ENV_KEEP.has(name.toUpperCase())) {
+    const upper = name.toUpperCase();
+    if (ENV_KEEP.has(upper)) {
       env[name] = value;
       continue;
     }
-    if (SECRET_ENV_NAME.test(name)) continue;
+    if (SECRET_ENV_EXACT.has(upper) || SECRET_ENV_NAME.test(name)) continue;
     env[name] = value;
   }
   env['CLAUDE_CONFIG_DIR'] = configDir;
@@ -593,26 +620,127 @@ export function classifyRail(task: Task, toolName: string, input: Record<string,
 }
 
 // Shapes that hide what a command does from any reader, this one included. Splitting handles the
-// separators; anything left in a segment that can spawn, substitute or redirect is not vouchable.
-const OPAQUE_SHELL = /[`><]|\$\(|\$\{|\bexec\b/;
+// separators; anything left in a segment that can spawn, substitute, expand or redirect is not
+// vouchable.
+//
+// `$` and `%NAME%` are here rather than only `$(` and `${` because of Sol's re-check bypass six:
+// `cat "$HOME/.ssh/id_rsa"` reaches the classifier as the literal relative path `$HOME/.ssh/id_rsa`,
+// which resolves inside the task folder, and reaches the shell as the real home directory. A
+// classifier that cannot see what a word will become must not vouch for it. A leading `~` is the
+// same trick with different spelling. `>` and `<` cover every redirection form, so no vouched
+// command can write its output anywhere.
+const OPAQUE_SHELL = /[`><$]|%[A-Za-z_][A-Za-z0-9_]*%|(^|\s)~|\bexec\b/;
+
+// Anything that executes a file, a string or a project script. Never vouched safe, no exceptions,
+// not even for a script inside the task folder (decisions log, 2026-08-01). The old code vouched
+// for `node whatever.js` as long as the file was in the project, which Sol's re-check finding 2
+// turned into unrestricted code execution in three steps: Write cleanup.js, put anything in it, run
+// it. A session that can write a file can write this file, so "the script is in the project" says
+// nothing about what the script does.
+//
+// They are named rather than merely left off the reader list so the human reading a stop gets a
+// sentence that explains itself.
+const INTERPRETERS = new Set([
+  'node', 'nodejs', 'deno', 'bun', 'bunx', 'npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'tsx', 'ts-node',
+  'python', 'python2', 'python3', 'py', 'pip', 'pipx', 'uv', 'uvx', 'ruby', 'perl', 'php', 'lua',
+  'r', 'rscript', 'osascript', 'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'csh', 'tcsh',
+  'cmd', 'command', 'powershell', 'pwsh', 'wscript', 'cscript', 'mshta', 'rundll32', 'regsvr32',
+  'java', 'javaw', 'dotnet', 'go', 'cargo', 'rustc', 'make', 'nmake', 'gradle', 'gradlew', 'mvn',
+  'ant', 'msbuild', 'env', 'xargs', 'eval', 'source', 'start', 'call', 'nohup', 'setsid', 'watch',
+]);
+
+/**
+ * A command Conductor is prepared to vouch for, and the exact shapes of it that it will vouch for.
+ *
+ * `flags` is an allowlist, not a filter: a flag that does not match makes the whole segment
+ * unvouchable. Sol's re-check finding 3 is what forced that round. The old code passed any flag it
+ * did not specifically object to, so `sort -o important.txt` and `rg --pre ./evil.cmd` were vouched
+ * as reads. There is no way to enumerate the flags that turn a reader into a writer or a launcher;
+ * there is a way to enumerate the ones that do not.
+ */
+interface Reader {
+  /** Flags this command may carry. Null means it may carry none. */
+  flags: RegExp | null;
+  /** Flags that consume the next word as their value, so it is not read as a path. */
+  valueFlags?: RegExp;
+  /**
+   * How bare arguments are read. `paths` are checked against the task folder, `none` are not paths
+   * at all, `patternThenPaths` treats the first bare word as a search pattern and the rest as paths.
+   */
+  args: 'paths' | 'none' | 'patternThenPaths';
+  /** DOS-style `/x` switches, which would otherwise read as absolute POSIX paths. */
+  slashFlags?: boolean;
+}
 
 // Commands whose plain form only reads. Every entry is a promise: no writes, no network, no
 // spawning something else. Kept short on purpose, because each addition is a hole if it is wrong.
-const VOUCHED_READERS = new Set([
-  'ls', 'dir', 'pwd', 'cd', 'echo', 'cat', 'type', 'head', 'tail', 'wc', 'sort', 'uniq',
-  'grep', 'findstr', 'rg', 'stat', 'file', 'tree', 'du', 'df', 'which', 'where', 'whoami',
-  'hostname', 'date', 'uname', 'basename', 'dirname', 'true', 'false',
+const VOUCHED_READERS = new Map<string, Reader>([
+  ['ls', { flags: /^(-[1AaCFhlrRSt]+|--(all|almost-all|human-readable|reverse|recursive|classify|group-directories-first|no-color|color(=[\w-]+)?|sort=\w+|time=\w+))$/, args: 'paths' }],
+  ['dir', { flags: /^\/[abdlnopqswx4](:[\w-]+)?$/i, args: 'paths', slashFlags: true }],
+  ['pwd', { flags: /^-[LP]$/, args: 'none' }],
+  ['cd', { flags: null, args: 'paths' }],
+  ['echo', { flags: /^-[neE]$/, args: 'none' }],
+  ['cat', { flags: /^(-[bEnstTv]+|--(number|number-nonblank|show-ends|show-tabs|squeeze-blank))$/, args: 'paths' }],
+  ['type', { flags: null, args: 'paths' }],
+  ['head', { flags: /^(-\d+|-[nc]\d*|--(lines|bytes)=\d+)$/, valueFlags: /^(-[nc]|--lines|--bytes)$/, args: 'paths' }],
+  ['tail', { flags: /^(-\d+|-[nc]\d*|--(lines|bytes)=\d+)$/, valueFlags: /^(-[nc]|--lines|--bytes)$/, args: 'paths' }],
+  ['wc', { flags: /^(-[lwcmL]+|--(lines|words|bytes|chars|max-line-length))$/, args: 'paths' }],
+  // No -o and no --output: that is Sol's bypass four, a reader that writes a file.
+  ['sort', { flags: /^(-[bdfghinrsuVz]+|-k\S+|-t.|--(ignore-case|numeric-sort|human-numeric-sort|reverse|unique|stable|version-sort|key=\S+|field-separator=.))$/, valueFlags: /^(-k|-t|--key|--field-separator)$/, args: 'paths' }],
+  ['uniq', { flags: /^(-[cdiuz]+|--(count|repeated|unique|ignore-case))$/, args: 'paths' }],
+  ['grep', { flags: /^(-[EFGHhIiLlnoqRrsvwxZ]+|-[ABC]\d+|--(color(=\w+)?|no-color|ignore-case|line-number|recursive|word-regexp|fixed-strings|extended-regexp|invert-match|files-with-matches|files-without-match|only-matching|count|no-messages|include=\S+|exclude=\S+|exclude-dir=\S+|binary-files=\w+|max-count=\d+))$/, valueFlags: /^(-[emABC]|--(regexp|include|exclude|exclude-dir|max-count))$/, args: 'patternThenPaths' }],
+  // No --pre and no --pre-glob and no --hostname-bin: that is Sol's bypass five, a reader that
+  // launches an arbitrary program on every file it touches.
+  ['rg', { flags: /^(-[cFHiILlNnovwx]+|-[ABC]\d+|--(hidden|no-ignore|no-heading|heading|line-number|no-line-number|with-filename|no-filename|files|count|count-matches|fixed-strings|ignore-case|smart-case|case-sensitive|word-regexp|invert-match|json|no-color|color=\w+|max-count=\d+|max-depth=\d+|glob=\S+|type=\S+|type-not=\S+|context=\d+|after-context=\d+|before-context=\d+))$/, valueFlags: /^(-[egt]|--(regexp|glob|type|type-not|max-count|max-depth|context|after-context|before-context))$/, args: 'patternThenPaths' }],
+  ['findstr', { flags: /^\/[a-z](:\S*)?$/i, args: 'patternThenPaths', slashFlags: true }],
+  ['stat', { flags: /^(-[Lft]|--(format=\S+|printf=\S+|terse|dereference))$/, valueFlags: /^(-c|--format|--printf)$/, args: 'paths' }],
+  ['file', { flags: /^-[bhiLz]+$/, args: 'paths' }],
+  ['tree', { flags: /^(-[adfilpqsuFL]+|--(dirsfirst|noreport|charset=\S+))$/, valueFlags: /^-L$/, args: 'paths' }],
+  ['du', { flags: /^(-[abchksxm]+|--(human-readable|summarize|max-depth=\d+|all|bytes))$/, args: 'paths' }],
+  ['df', { flags: /^(-[hikPT]+|--(human-readable|portability))$/, args: 'paths' }],
+  ['which', { flags: /^-a$/, args: 'none' }],
+  ['where', { flags: null, args: 'none' }],
+  ['whoami', { flags: null, args: 'none' }],
+  ['hostname', { flags: null, args: 'none' }],
+  ['uname', { flags: /^-[amnoprsv]+$/, args: 'none' }],
+  ['date', { flags: /^(-u|--utc|\+[^\s`$]+)$/, args: 'none' }],
+  ['basename', { flags: null, args: 'none' }],
+  ['dirname', { flags: null, args: 'none' }],
+  ['true', { flags: null, args: 'none' }],
+  ['false', { flags: null, args: 'none' }],
 ]);
 
-// Vouched readers whose bare arguments are paths, so an argument leaving the task folder is a read
-// outside the rail. Sol noted PATH_FIELDS never sees a path buried in a shell command; this does.
-const PATH_ARG_READERS = new Set(['ls', 'dir', 'cat', 'type', 'head', 'tail', 'wc', 'stat', 'file', 'tree', 'du', 'cd']);
+// Global git flags, meaning the ones that may appear before the subcommand. Only one, because the
+// rest of them relocate git (-C, --git-dir, --work-tree) or make it run a program of the caller's
+// choosing (-c core.pager=..., --exec-path).
+const GIT_GLOBAL_FLAG = /^--no-pager$/;
 
-// git subcommands that only report. Anything not named here is unvouched, including config.
-const VOUCHED_GIT = new Set(['status', 'log', 'diff', 'show', 'remote', 'rev-parse', 'ls-files', 'describe', 'blame', 'shortlog', 'stash']);
+// Flags a read-only git subcommand may carry. Every one of these changes how git reports; none of
+// them changes anything on disk. --output is absent, which is Sol's bypass three: `git diff
+// --output=C:/Users/victim/important.txt` overwrites a file outside the task folder while looking
+// like the most ordinary read in the list.
+const GIT_READ_FLAG =
+  /^(-\d+|-[psuv]|--(oneline|stat|numstat|shortstat|summary|patch|no-patch|raw|name-only|name-status|graph|decorate(=\w+)?|no-decorate|abbrev-commit|no-abbrev|short|porcelain(=\S+)?|no-color|color(=\w+)?|cached|staged|all|branches|tags|remotes|reverse|first-parent|no-merges|merges|follow|find-renames|no-renames|full-index|unified=\d+|word-diff(=\w+)?|ignore-all-space|ignore-space-change|text|stat-width=\d+|pretty(=\S+)?|format(=\S+)?|date=\S+|since=\S+|until=\S+|author=\S+|committer=\S+|grep=\S+|max-count=\d+|skip=\d+|verbose|quiet|show-toplevel|git-dir|abbrev-ref|symbolic-full-name|is-inside-work-tree|verify|others|modified|deleted|ignored|stage|exclude-standard|error-unmatch|full-name|line-porcelain|line-number|tags-only|contains|long|always|dirty(=\S+)?))$/;
 
-// node flags that turn "run this file" into "run whatever string I hand you".
-const NODE_EVAL_FLAG = /^--?(e|p|eval|print|require|r|import|experimental-loader)(=|$)/i;
+const GIT_VALUE_FLAG = /^(-[nSGL]|--(max-count|skip|pretty|format|date|grep|author|committer|since|until|unified|contains))$/;
+
+// git subcommands that only report. The value is the set of second words allowed after it, or null
+// when the subcommand takes no second word that changes what it does. `git remote` is the reason
+// this map is not a set: `git remote -v` reports, and `git remote remove origin` rewrites
+// .git/config, which is Sol's bypass two.
+const VOUCHED_GIT = new Map<string, Set<string> | null>([
+  ['status', null],
+  ['log', null],
+  ['diff', null],
+  ['show', null],
+  ['rev-parse', null],
+  ['ls-files', null],
+  ['describe', null],
+  ['blame', null],
+  ['shortlog', null],
+  ['remote', new Set(['', 'show', 'get-url'])],
+  ['stash', new Set(['list', 'show'])],
+]);
 
 /**
  * The vouching half of deny-by-default. Returns null when the whole command is positively safe, or
@@ -621,7 +749,7 @@ const NODE_EVAL_FLAG = /^--?(e|p|eval|print|require|r|import|experimental-loader
 export function vouchSafe(cwd: string, command: string): string | null {
   const trimmed = command.trim();
   if (!trimmed) return 'it is empty';
-  if (OPAQUE_SHELL.test(trimmed)) return 'it redirects, substitutes or spawns, so its effect is not readable';
+  if (OPAQUE_SHELL.test(trimmed)) return 'it redirects, substitutes, expands or spawns, so its effect is not readable';
 
   const segments = trimmed.split(/\s*(?:\|\||&&|[;|&\n])\s*/).map((s) => s.trim()).filter((s) => s.length > 0);
   if (segments.length === 0) return 'it is empty';
@@ -640,51 +768,92 @@ function vouchSegment(cwd: string, segment: string): string | null {
   // A leading VAR=value assignment can change what the next word resolves to.
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) return `"${head}" sets an environment variable inline`;
 
-  const name = commandName(head);
+  const named = commandWord(head);
+  if (typeof named !== 'string') return named.doubt;
   const args = parts.slice(1);
 
-  if (name === 'git') return vouchGit(cwd, args);
-  if (name === 'node') return vouchNode(cwd, args);
-  if (name === 'npm') return vouchNpm(args);
+  if (INTERPRETERS.has(named)) return `"${named}" runs code, and Conductor never vouches for an interpreter whatever it is pointed at`;
+  if (named === 'git') return vouchGit(args);
 
-  if (!VOUCHED_READERS.has(name)) return `"${name}" is not on the short list of commands Conductor can vouch for`;
-  if (PATH_ARG_READERS.has(name)) return pathArgsInsideCwd(cwd, args);
+  const reader = VOUCHED_READERS.get(named);
+  if (!reader) return `"${named}" is not on the short list of commands Conductor can vouch for`;
+  return vouchReader(cwd, named, reader, args);
+}
+
+/** Walks one vouched reader's arguments: every flag allowlisted, every path inside the folder. */
+function vouchReader(cwd: string, name: string, reader: Reader, args: string[]): string | null {
+  let bare = 0;
+  let flagsEnded = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
+    if (arg === '--') {
+      flagsEnded = true;
+      continue;
+    }
+    if (!flagsEnded && looksLikeFlag(arg, reader)) {
+      // valueFlags is itself an allowlist, and it is checked first because these flags are spelled
+      // both ways: `--glob "*.ts"` and `--glob=*.ts` are the same flag, and only the first form
+      // swallows the word after it.
+      if (reader.valueFlags?.test(arg)) {
+        i++; // its value is a value, not a path
+        continue;
+      }
+      if (!reader.flags || !reader.flags.test(arg)) return `"${name} ${arg}" is not a flag Conductor can vouch for`;
+      continue;
+    }
+    bare++;
+    if (reader.args === 'none') continue;
+    if (reader.args === 'patternThenPaths' && bare === 1) continue;
+    const path = stripQuotes(arg);
+    if (!insideCwd(cwd, path)) return `"${arg}" is outside the task folder`;
+  }
   return null;
 }
 
-function vouchGit(cwd: string, args: string[]): string | null {
-  // -C and --git-dir point git at another checkout, which is how a vouched-looking read becomes a
-  // write somewhere nobody is watching.
-  const escape = args.find((a) => a === '-C' || a.startsWith('--git-dir') || a.startsWith('--work-tree'));
-  if (escape) return `git "${escape}" points at another checkout`;
-  const sub = args.find((a) => !a.startsWith('-'));
-  if (!sub) return 'git with no subcommand';
+function looksLikeFlag(arg: string, reader: Reader): boolean {
+  if (arg.length > 1 && arg.startsWith('-')) return true;
+  return reader.slashFlags === true && arg.length > 1 && arg.startsWith('/');
+}
+
+/**
+ * git, split at the subcommand: words before it are global flags that can relocate git or make it
+ * run a program, words after it belong to a subcommand that must be a reporting one.
+ */
+function vouchGit(args: string[]): string | null {
+  let sub: string | null = null;
+  let subAt = -1;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? '';
+    if (arg.startsWith('-')) {
+      if (!GIT_GLOBAL_FLAG.test(arg)) return `git "${arg}" before the subcommand can relocate git or make it run a program`;
+      continue;
+    }
+    sub = arg;
+    subAt = i;
+    break;
+  }
+  if (sub === null) return 'git with no subcommand';
   if (!VOUCHED_GIT.has(sub)) return `"git ${sub}" is not one of the read-only git subcommands`;
-  // `git stash` with no argument stashes; only `git stash list` reads.
-  if (sub === 'stash' && args[args.indexOf(sub) + 1] !== 'list') return 'bare "git stash" changes the working tree';
-  return null;
-}
 
-function vouchNode(cwd: string, args: string[]): string | null {
-  const evalFlag = args.find((a) => NODE_EVAL_FLAG.test(a));
-  if (evalFlag) return `node "${evalFlag}" runs a string rather than a file in this project`;
-  const script = args.find((a) => !a.startsWith('-'));
-  if (!script) return 'node with no script runs an interactive interpreter';
-  if (!insideCwd(cwd, script)) return `the script "${script}" is outside the task folder`;
-  return null;
-}
+  const rest = args.slice(subAt + 1);
+  const allowedSecond = VOUCHED_GIT.get(sub);
+  if (allowedSecond) {
+    const second = rest.find((a) => !a.startsWith('-')) ?? '';
+    if (!allowedSecond.has(second)) return `"${`git ${sub} ${second}`.trim()}" is not one of the read-only forms of "git ${sub}"`;
+  }
 
-function vouchNpm(args: string[]): string | null {
-  const sub = args.find((a) => !a.startsWith('-'));
-  if (sub === 'ls' || sub === 'view' || sub === 'outdated' || sub === 'why') return null;
-  return `"npm ${sub ?? ''}" can run project scripts or reach the network`;
-}
-
-/** Any bare argument that resolves outside the task folder makes the whole segment unvouchable. */
-function pathArgsInsideCwd(cwd: string, args: string[]): string | null {
-  for (const arg of args) {
-    if (arg.startsWith('-')) continue;
-    if (!insideCwd(cwd, stripQuotes(arg))) return `"${arg}" is outside the task folder`;
+  // Bare words after the subcommand are refs and pathspecs. They are not path-checked, because git
+  // resolves a pathspec against the repository and reports rather than writes; the flags above are
+  // where a reporting subcommand could have been turned into a writing one, and they are allowlisted.
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i] ?? '';
+    if (arg === '--') break;
+    if (!arg.startsWith('-')) continue;
+    if (GIT_VALUE_FLAG.test(arg)) {
+      i++;
+      continue;
+    }
+    if (!GIT_READ_FLAG.test(arg)) return `"git ${sub} ${arg}" is not a flag Conductor can vouch for`;
   }
   return null;
 }
@@ -703,10 +872,29 @@ function stripQuotes(value: string): string {
   return value.replace(/^["']|["']$/g, '');
 }
 
-/** `C:\\Windows\\System32\\cmd.exe` and `/bin/ls` both reduce to the name the allowlist knows. */
-function commandName(head: string): string {
-  const bare = basename(stripQuotes(head)).toLowerCase();
-  return bare.endsWith('.exe') || bare.endsWith('.cmd') || bare.endsWith('.bat') ? bare.slice(0, bare.lastIndexOf('.')) : bare;
+// An executable spelled as a file rather than as a name. `.js` and `.py` are here too: on Windows
+// PATHEXT and file associations make them runnable words in their own right.
+const EXECUTABLE_SUFFIX = /\.(exe|com|cmd|bat|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|msc|scr|py|sh)$/i;
+
+/**
+ * The word at the head of a segment, if it is a bare command name Conductor can look up. Anything
+ * else is refused rather than reduced.
+ *
+ * The old version took the basename and dropped the extension, so `./git.cmd status` and
+ * `C:\evil\git.exe log` both classified as git. Sol's re-check finding 2b: a repository can contain
+ * an executable called git, and a session can write one. A name resolved through PATH is a
+ * different thing from a file the session can control, and the classifier cannot tell them apart
+ * once it has thrown the path away, so it does not throw the path away. It refuses.
+ */
+function commandWord(head: string): string | { doubt: string } {
+  const raw = stripQuotes(head);
+  if (raw.includes('/') || raw.includes('\\')) {
+    return { doubt: `"${raw}" names a file to run rather than a known command, so Conductor cannot tell what it is` };
+  }
+  if (EXECUTABLE_SUFFIX.test(raw)) {
+    return { doubt: `"${raw}" is an executable file, and a file in reach of the session is not a command Conductor can vouch for` };
+  }
+  return raw.toLowerCase();
 }
 
 /** Tool inputs spell a command as a string or as an argv array. Both get read. */

@@ -140,3 +140,16 @@ export function usableAccounts(config: Config): AccountEntry[] {
     return true;
   });
 }
+
+/**
+ * The one way to turn a task's account name into a directory a session may run against.
+ *
+ * Sol's re-check finding 7: the checks above only ever ran on the listing path, while the task
+ * loop looked the name up in the raw registry and checked placeholder and existence itself. So an
+ * account whose login sits inside a git checkout was excluded from every list and still handed to
+ * CLAUDE_CONFIG_DIR when a task named it. Every caller that is about to execute goes through here,
+ * so there is one set of rules and no second, weaker copy of them.
+ */
+export function resolveAccount(config: Config, name: string): AccountEntry | null {
+  return usableAccounts(config).find((account) => account.name === name) ?? null;
+}
