@@ -565,7 +565,69 @@ Nothing else in M2 is safe without this, so it goes first.
   that was noticed. Reinstalled, typecheck confirmed clean, CLI output confirmed by running it.
   The lesson is the one already in the golden rules: `&&` chains that end in `;` do not gate
   anything, and a verification that cannot fail is not a verification.
-- Still unmerged and correctly so. Sol round 2 in flight over the whole slice.
+- **Sol round 2: still not safe to merge.** Twelve findings, six blocking, four of which destroy
+  work undo exists to protect. `docs/notes/sol-review-m2-sliceA-round2.md`. Nothing from round one
+  came back, so every fix held. The new findings are in what those fixes do not cover, and the
+  architect stopped here rather than starting a third round. Stop condition 6 and overnight
+  assumption A6 both point the same way: two failures on one problem means the design is the
+  question, not the code.
+
+### Slice A, the design question it raised
+
+Read the pattern, not the list. Round one: fifteen findings, fixed, all held. Round two: twelve new
+ones through doors nobody had thought about. That is the rail's shape exactly, and the rail was
+only settled by deleting the mechanism rather than improving it.
+
+Three classes generate every finding, and each keeps producing new members:
+
+1. **The tree is shared with a human.** Sol's finding 3 is the deep one: the post-image proves
+   timing, not authorship. An edit Kane makes *while a task runs* lands inside
+   checkpoint..post-image and comes back labelled "changed by the task". The post-image narrowed
+   round one's failure; it did not close it, and nothing that compares snapshots can, because two
+   authors writing in one interval are indistinguishable by snapshot. Finding 1 is the same class
+   in time: the plan is computed, shown, then applied later against a tree that moved.
+2. **Undo is selective.** Deciding per path what to restore, delete or hold generates edge cases
+   without end: ignore rules added mid-task (2), case aliasing (4), a file renamed out of the
+   ignore set with no bytes anywhere to restore (6), file-to-directory replacement (7).
+3. **It is routed through git.** Using git's index and refs drags in git's semantics and side
+   effects: filters and `reference-transaction` hooks actually execute repository code (8), sparse
+   checkout records paths not on disk (9), tree objects cannot hold empty directories (10), and
+   `.gitattributes` can transform bytes invisibly.
+
+**The dissolution, and it is the same move as the rail: remove the thing rather than model it.**
+Run each task in its own fresh git worktree. Then:
+
+- Nobody else is writing in that tree, so provenance is not inferred, it is structural. Class 1 is
+  gone, including findings 1 and 3.
+- Undo stops being selective. It becomes "discard the worktree", which is total, instant and
+  exact. Class 2 is gone entirely: no plan, no fingerprint, no ignore set, no case collisions, no
+  held set.
+- There is no before-image to capture, so class 3 mostly goes with it. No `add -A`, no
+  `update-ref`, so no filters and no `reference-transaction` hook firing on the user's repo.
+- `checkpoint.ts`, currently 990 lines, collapses to roughly "make a worktree, remove a worktree".
+  That is the simplicity budget being paid back with interest.
+- Slice B gets its place boundary free. "The task may only write inside its worktree" is a
+  filesystem fact, not a judgement about a string, which is precisely what three failed rail
+  rounds said we needed.
+
+**What it costs, stated honestly, because this is Kane's call:**
+
+- Tasks stop running in the folder Kane is looking at. Output arrives as commits on a branch to
+  review and merge, not as edits appearing in place.
+- A fresh worktree has no untracked or ignored files, so local `.env` files, build output and
+  anything else git does not track are absent. Tasks needing those either get them copied in
+  deliberately or fail honestly.
+- Some work genuinely wants the real folder, for example running the app against local config.
+  Those tasks would need an in-place mode, which would carry the weaker guarantee and should say so.
+
+**The alternative, if that friction is unacceptable:** keep working in place, close findings 1, 2,
+3, 4 and 6, state 8 honestly, and then accept that undo is a convenience rather than a guarantee.
+That is a coherent position. It just means the permissive default cannot rest on undo, and would
+need earning some other way or dropping. What is not available is in-place undo strong enough to
+justify unattended work; two review rounds are the evidence.
+
+**Recommendation: worktree isolation.** It dissolves three classes instead of patching members,
+pays back the simplicity budget, and hands slice B the boundary it needs. Awaiting Kane.
 - Notebook fact from this review: the codex read-only sandbox cannot launch a process on this
   host, so Sol's first run read nothing and correctly refused to review rather than invent
   findings. The workaround is to inline the files, line-numbered, in the brief. Worth knowing
