@@ -237,14 +237,18 @@ src/
 
 - [x] Start one Agent SDK session against a chosen account config dir.
 - [x] Stream turns out to whoever is connected.
-- [~] Per-task trust level controls the permission mode, per D9. Destructive actions always stop.
+- [x] Per-task trust level controls the permission mode, per D9. Destructive actions always stop.
 - Evidence: Slice 2, commit `b721536` on `feat/m1-engine`. Sessions run per task with
   `CLAUDE_CONFIG_DIR` from the account registry and the API key stripped from the child env.
   Trust maps attended to default permissions and autonomous to acceptEdits scoped to the task
   cwd, never bypassPermissions. Messages stream to a callback for the doors. The destructive rail
   is enforced in `canUseTool`, which the SDK warns can be shadowed by allow-rules in the user's
-  own settings files: strong against the model, weak against settings. Slice 3 moves it to a
-  `PreToolUse` hook; the box stays `[~]` until then.
+  own settings files: strong against the model, weak against settings. Slice 3 (commit `3a767e0`)
+  moved the rail to a `PreToolUse` hook with `canUseTool` kept as layer two, every stop logged as
+  a `rail_stop` event. Proven live: an attended task's file deletion stopped until y was typed at
+  the CLI; the same action under autonomous trust with no door attached was denied, logged with
+  `door: null`, and the file survived. One SDK wrinkle measured and fixed: `canUseTool` still
+  fires after a hook allow, which double-prompted the human until a one-shot ticket was added.
 
 ### The cut
 
@@ -278,9 +282,16 @@ src/
 
 ### Doors
 
-- [ ] HTTP plus WebSocket server on 127.0.0.1 only.
-- [ ] CLI: start the daemon, show status and gauge, add a task, run a task, tail the log.
-- Evidence:
+- [x] HTTP plus WebSocket server on 127.0.0.1 only.
+- [x] CLI: start the daemon, show status and gauge, add a task, run a task, tail the log.
+- Evidence: Slice 3, commit `3a767e0`. Endpoints: `/status`, `/gauge`, `/events?tail=N`,
+  `POST /tasks`, `POST /run`, `/ws` for streamed turns, approvals both ways, and messages into a
+  running session (documented streaming-input surface; honest limit: a task still ends at its
+  first result message, so mid-turn only, not a chat channel yet). `netstat` shows
+  `127.0.0.1:7719` only, the LAN address refuses, a second daemon exits `EADDRINUSE`, and bind
+  failure exits loudly rather than widening. CLI has all five commands plus `daemon` and `watch`;
+  pure HTTP/WS client with no direct state access, per one-engine-many-doors. Transcripts in
+  `docs/notes/m1-slice3-findings.md`.
 
 ### Review and land
 
@@ -358,3 +369,9 @@ Append here when a design call is made during the build. Date, decision, reason,
 - 2026-08-01. `zod` accepted as the second runtime dependency. Reason: the SDK's `tool()` takes a
   zod schema and ships zod only as a peer dependency; declaring it beats silently relying on
   hoisting. Runtime deps are now exactly two: the SDK and zod.
+- 2026-08-01. `ws` accepted as the third and final M1 runtime dependency (D6 transport), with
+  `@types/ws` dev-only because `ws` ships no types. M1 runtime deps are closed at three.
+- 2026-08-01. Approvals carry provenance: an approval result records which door answered, and a
+  denial with no door attached logs `door: null`. Reason: the engine cannot know a door is real;
+  logging the difference between "denied by human" and "denied because nobody was watching" is
+  what the review loop will need.
