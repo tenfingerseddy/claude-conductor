@@ -4,7 +4,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { PLAYBOOK_SEED } from './state/playbook.ts';
 
 /** A named Claude account: a label plus the CLAUDE_CONFIG_DIR a session runs against. */
@@ -47,9 +47,36 @@ export function resolveStateRoot(): string {
   return override ? resolve(override) : join(homedir(), '.conductor');
 }
 
+/**
+ * Walks up from a directory looking for a `.git`, so "is this inside a checkout" can be answered
+ * without shelling out to git. Returns the work tree root, or null.
+ *
+ * This exists for one reason: state and Claude config directories hold usage data, handoffs, the
+ * daemon token and, in an account directory, a login. None of that may ever land inside a
+ * repository, and this one is public (golden rules 1 and 5). A path check is cheap and the failure
+ * it prevents is not recoverable once it has been pushed.
+ */
+export function gitWorkTreeAbove(dir: string): string | null {
+  let current = resolve(dir);
+  for (;;) {
+    if (existsSync(join(current, '.git'))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
 /** Resolves the state root, creates the tree on first run, and loads the account registry. */
 export function loadConfig(): Config {
   const stateRoot = resolveStateRoot();
+  const repo = gitWorkTreeAbove(stateRoot);
+  if (repo) {
+    throw new Error(
+      `conductor: the state root "${stateRoot}" is inside the git checkout at "${repo}". ` +
+        `Conductor keeps usage data, handoffs and its daemon token there, and none of that may sit ` +
+        `in a repository. Point CONDUCTOR_HOME somewhere outside any checkout and start again.`,
+    );
+  }
   const configFilePath = join(stateRoot, 'config.json');
   const playbookPath = join(stateRoot, 'playbook.md');
   const eventsPath = join(stateRoot, 'events.jsonl');
@@ -93,7 +120,23 @@ function readAccounts(configFilePath: string): AccountEntry[] {
     }));
 }
 
-/** Accounts the user has actually pointed at a real login. */
+/**
+ * Accounts the user has actually pointed at a real login. An account directory inside a git
+ * checkout is refused rather than used: it holds the login Claude Code created, and a login inside
+ * a repository is the one mistake that cannot be walked back after a push.
+ */
 export function usableAccounts(config: Config): AccountEntry[] {
-  return config.accounts.filter((a) => !a.placeholder && existsSync(a.configDir));
+  return config.accounts.filter((account) => {
+    if (account.placeholder || !existsSync(account.configDir)) return false;
+    const repo = gitWorkTreeAbove(account.configDir);
+    if (repo) {
+      process.stderr.write(
+        `conductor: account "${account.name}" points at "${account.configDir}", which is inside the ` +
+          `git checkout at "${repo}". Claude's login lives in that folder, so the account is ignored. ` +
+          `Move it outside any checkout.\n`,
+      );
+      return false;
+    }
+    return true;
+  });
 }

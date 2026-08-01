@@ -6,10 +6,14 @@
 //   2. rate_limit_event messages, logged as pressure signals, never read as a percentage (S3).
 //   3. <configDir>\.claude.json -> cachedUsageUtilization, gated on fetchedAtMs (S2). SDK sessions
 //      never refresh this block, so it is usually stale and is a calibration anchor, not a meter.
-//   4. Self-metering summed from result messages. Always on. The floor and the primary number.
+//   4. Self-metering summed from result messages, per model, per rolling window. Always on. The
+//      floor and the primary number.
 //
-// The rule every layer obeys: an absent reading is null, never zero. Zero headroom shown as full
-// headroom is the failure mode that matters.
+// Two rules every layer obeys. An absent reading is null, never zero: zero headroom shown as full
+// headroom is the failure mode that matters. And every degradation changes the label. Sol's pass 3
+// found the one unforgivable version of the second rule broken, where a failed live probe left the
+// last reading cached and still saying "official, live"; the gauge would then report headroom it
+// did not have, with a label claiming that number came from Anthropic just now.
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -19,9 +23,22 @@ import { logEvent } from '../state/logbook.ts';
 /** S2: past this age a reading is estimated-only, never presented as current headroom. */
 export const STALE_AFTER_MS = 90 * 60 * 1000;
 
+/** The two windows the plan actually meters. Self-metering rolls on both (SPEC, the Gauge organ). */
+export const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+export const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// A timestamp this far ahead of us is a broken clock, not a fresh reading.
+const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000;
+
 // Advisory in M1. The playbook page carries the same numbers in prose; M2 makes it the source.
 export const CONTEXT_CHECKPOINT_PERCENT = 60;
 export const WINDOW_CHECKPOINT_PERCENT = 70;
+
+// Calibration guards. Spending tokens cannot give headroom back, so a negative rate is the window
+// rolling over rather than anything the meter can learn. And a plan that burned a whole window in
+// ten thousand tokens does not exist, so anything steeper than this is a malformed reading.
+const MIN_TOKENS_TO_CALIBRATE = 1_000;
+const MAX_PERCENT_PER_TOKEN = 0.01;
 
 // The SDK tells consumers not to depend on this method, so it is reached by name and never imported.
 const USAGE_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
@@ -111,9 +128,21 @@ export function readOfficialFile(configDir: string, now: number = Date.now()): F
 
   const fetchedRaw = block['fetchedAtMs'];
   const fetchedAtMs = typeof fetchedRaw === 'number' && Number.isFinite(fetchedRaw) ? fetchedRaw : null;
-  const ageMs = fetchedAtMs === null ? null : Math.max(0, now - fetchedAtMs);
-  // An undated reading is ancient, not current. Same rule the account switcher already uses.
-  const confidence: Confidence = ageMs === null ? 'unknown' : ageMs > STALE_AFTER_MS ? 'stale' : 'fresh';
+  const rawAgeMs = fetchedAtMs === null ? null : now - fetchedAtMs;
+  const ageMs = rawAgeMs === null ? null : Math.max(0, rawAgeMs);
+  // Two ways this gate used to fail open, both from Sol's pass 3 finding 4. An undated reading
+  // became "unknown" and then rendered as "official, from disk", which reads as current. And a
+  // future timestamp was clamped to age zero, so a skewed clock made an ancient reading fresh.
+  // Neither is now allowed to pass as current: the label says the age is unknown and the reading
+  // is treated as stale everywhere freshness is what matters.
+  const confidence: Confidence =
+    fetchedAtMs === null || rawAgeMs === null
+      ? 'unknown'
+      : rawAgeMs < -CLOCK_SKEW_TOLERANCE_MS
+        ? 'unknown'
+        : rawAgeMs > STALE_AFTER_MS
+          ? 'stale'
+          : 'fresh';
 
   const utilization = block['utilization'];
   if (!isRecord(utilization)) return { fetchedAtMs, ageMs, fiveHour: ABSENT_READING, weekly: ABSENT_READING };
@@ -133,16 +162,33 @@ export interface ModelTotals {
   cacheRead: number;
 }
 
+/** One metered result, kept with its timestamp so the windows can roll. */
+interface Sample {
+  at: number;
+  model: string;
+  tokens: number;
+}
+
+/** Where an estimate starts from: an official percentage and the metered total at that moment. */
+interface Anchor {
+  percent: number;
+  tokens: number;
+  at: number;
+  source: ReadingSource;
+}
+
 /** Everything a door needs to show the gauge, with source and freshness on every number. */
 export interface GaugeSnapshot {
   account: string;
   fiveHour: Reading;
   weekly: Reading;
   selfMeteredTokens: number;
+  selfMeteredFiveHour: number;
   selfMeteredByModel: Record<string, ModelTotals>;
   contextPercent: number | null;
   contextPeakPercent: number | null;
   fileAgeMs: number | null;
+  liveProbeFailed: boolean;
   pressure: string | null;
   line: string;
 }
@@ -156,16 +202,22 @@ export class Gauge {
   readonly configDir: string;
   private readonly config: Config;
   private readonly byModel = new Map<string, ModelTotals>();
+  // Timestamped, because a total that only ever grows cannot represent a window that rolls. SPEC's
+  // Gauge organ asks for per rolling window and Sol's pass 3 finding 2 showed what the missing
+  // window cost: an official percentage falling as old usage aged out taught calibration that
+  // spending tokens creates headroom.
+  private samples: Sample[] = [];
   private live: LiveUsage | null = null;
+  private liveAt: number | null = null;
+  private liveProbeFailed = false;
   private file: FileUsage | null = null;
   private contextPercent: number | null = null;
   private contextPeak: number | null = null;
   private pressure: string | null = null;
-  // Calibration anchor: the last official percentage seen, and the self-metered total at that
-  // moment. The gap between the two on the next official reading is the calibration event.
-  private anchorPercent: number | null = null;
-  private anchorTokens = 0;
-  private percentPerToken: number | null = null;
+  // Calibration state, per window. Kept per window because the five-hour and weekly limits are
+  // different sizes, so one percent-per-token rate cannot describe both (Sol pass 3 finding 3).
+  private readonly anchors: Record<keyof UsageWindows, Anchor | null> = { fiveHour: null, weekly: null };
+  private readonly rates: Record<keyof UsageWindows, number | null> = { fiveHour: null, weekly: null };
 
   constructor(config: Config, account: string, configDir: string) {
     this.config = config;
@@ -181,23 +233,28 @@ export class Gauge {
    */
   refreshBeforeTask(): void {
     this.file = readOfficialFile(this.configDir);
-    if (!this.file) return;
-    this.logReading('session_5h', this.file.fiveHour);
-    this.logReading('weekly_all', this.file.weekly);
+    this.logReading('session_5h', this.pick('fiveHour'));
+    this.logReading('weekly_all', this.pick('weekly'));
   }
 
   /** Layer 4. Called for every result message the session produces. */
-  noteResult(modelUsage: unknown): void {
+  noteResult(modelUsage: unknown, at: number = Date.now()): void {
     if (!isRecord(modelUsage)) return;
     for (const [model, raw] of Object.entries(modelUsage)) {
       if (!isRecord(raw)) continue;
       const totals = this.byModel.get(model) ?? { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
-      totals.input += num(raw['inputTokens']);
-      totals.output += num(raw['outputTokens']);
-      totals.cacheCreation += num(raw['cacheCreationInputTokens']);
-      totals.cacheRead += num(raw['cacheReadInputTokens']);
+      const input = num(raw['inputTokens']);
+      const output = num(raw['outputTokens']);
+      const cacheCreation = num(raw['cacheCreationInputTokens']);
+      const cacheRead = num(raw['cacheReadInputTokens']);
+      totals.input += input;
+      totals.output += output;
+      totals.cacheCreation += cacheCreation;
+      totals.cacheRead += cacheRead;
       this.byModel.set(model, totals);
+      this.samples.push({ at, model, tokens: input + output + cacheCreation + cacheRead });
     }
+    this.prune(at);
   }
 
   /** Layer 2. A pressure interrupt, logged as an event and never read as a percentage. */
@@ -227,10 +284,21 @@ export class Gauge {
     return this.contextPeak;
   }
 
-  get selfMeteredTokens(): number {
+  /** Tokens metered inside a rolling window. The window is the honest unit; the all-time sum is not. */
+  meteredIn(windowMs: number, now: number = Date.now()): number {
+    const from = now - windowMs;
     let total = 0;
-    for (const t of this.byModel.values()) total += t.input + t.output + t.cacheCreation + t.cacheRead;
+    for (const sample of this.samples) if (sample.at >= from) total += sample.tokens;
     return total;
+  }
+
+  /** The widest window Conductor meters. Anything older has rolled out of every plan limit. */
+  get selfMeteredTokens(): number {
+    return this.meteredIn(WEEK_MS);
+  }
+
+  get selfMeteredFiveHour(): number {
+    return this.meteredIn(FIVE_HOUR_MS);
   }
 
   get selfMeteredByModel(): Record<string, ModelTotals> {
@@ -246,16 +314,20 @@ export class Gauge {
     this.noteContextPercent(await readContextPercent(queryObject));
 
     const live = await readLiveUsage(queryObject);
-    if (live) this.live = live;
+    if (live) {
+      this.live = live;
+      this.liveAt = Date.now();
+      this.liveProbeFailed = false;
+    } else {
+      // The whole of Sol's pass 3 finding 1 in one line: a probe that did not answer invalidates
+      // the reading it last answered with. The number may still be the best guess available, but it
+      // stops being called live, and pick() degrades it accordingly.
+      this.liveProbeFailed = true;
+    }
     this.file = readOfficialFile(this.configDir);
 
-    const official = live ?? this.file;
-    if (official) {
-      this.logReading('session_5h', official.fiveHour);
-      this.logReading('weekly_all', official.weekly);
-    } else {
-      this.logReading('session_5h', ABSENT_READING);
-    }
+    this.logReading('session_5h', this.pick('fiveHour'));
+    this.logReading('weekly_all', this.pick('weekly'));
 
     logEvent(this.config, {
       kind: 'gauge_reading',
@@ -266,7 +338,10 @@ export class Gauge {
       confidence: 'fresh',
     });
 
-    if (live) this.calibrate(live.fiveHour);
+    if (live) {
+      this.calibrate('fiveHour', live.fiveHour);
+      this.calibrate('weekly', live.weekly);
+    }
   }
 
   /**
@@ -280,10 +355,12 @@ export class Gauge {
       fiveHour: this.pick('fiveHour'),
       weekly: this.pick('weekly'),
       selfMeteredTokens: this.selfMeteredTokens,
+      selfMeteredFiveHour: this.selfMeteredFiveHour,
       selfMeteredByModel: this.selfMeteredByModel,
       contextPercent: this.contextPercent,
       contextPeakPercent: this.contextPeak,
       fileAgeMs: this.file?.ageMs ?? null,
+      liveProbeFailed: this.liveProbeFailed,
       pressure: this.pressure,
       line: this.line(),
     };
@@ -301,7 +378,10 @@ export class Gauge {
 
     parts.push(`5-hour window: ${describe(this.pick('fiveHour'))}`);
     parts.push(`weekly window: ${describe(this.pick('weekly'))}`);
-    parts.push(`this run has metered ${formatTokens(this.selfMeteredTokens)} tokens on this account`);
+    parts.push(
+      `metered on this account: ${formatTokens(this.selfMeteredFiveHour)} tokens in the last 5 hours, ` +
+        `${formatTokens(this.selfMeteredTokens)} this week`,
+    );
     if (this.pressure) parts.push(this.pressure);
 
     // The standing sentence. It is standing on purpose: a model told it is near a limit wraps up
@@ -320,29 +400,50 @@ export class Gauge {
     if (this.pressure) return true;
     if (this.contextPercent !== null && this.contextPercent >= CONTEXT_CHECKPOINT_PERCENT) return true;
     const five = this.pick('fiveHour');
-    return five.percent !== null && five.confidence !== 'stale' && five.percent >= WINDOW_CHECKPOINT_PERCENT;
+    return five.percent !== null && five.confidence === 'fresh' && five.percent >= WINDOW_CHECKPOINT_PERCENT;
   }
 
-  /** Highest-trust reading available for a window, with the anchor-plus-delta estimate as fallback. */
+  /** Is the cached live reading still allowed to call itself live? */
+  private liveIsCurrent(now: number = Date.now()): boolean {
+    if (this.liveProbeFailed) return false;
+    return this.liveAt !== null && now - this.liveAt <= STALE_AFTER_MS;
+  }
+
+  /**
+   * Highest-trust reading available for a window. Every fallthrough changes the label, and nothing
+   * that is no longer current is allowed to keep a current-sounding one.
+   */
   private pick(window: keyof UsageWindows): Reading {
     const live = this.live?.[window];
-    if (live && live.percent !== null) return live;
+    if (live && live.percent !== null) {
+      if (this.liveIsCurrent()) return live;
+      // Still the best official number seen, but it is no longer live. Project it forward if
+      // calibration has earned the right to, otherwise say plainly that it has gone stale.
+      return this.estimate(window) ?? { ...live, confidence: 'stale' };
+    }
 
     const file = this.file?.[window];
     if (file && file.percent !== null) {
-      if (file.confidence !== 'stale') return file;
-      const estimated = this.estimateFrom(file.percent);
-      return estimated ?? { ...file, source: 'official_file', confidence: 'stale' };
+      if (file.confidence === 'fresh') return file;
+      return this.estimate(window) ?? file; // file carries its own stale or unknown label
     }
     return ABSENT_READING;
   }
 
-  /** Anchor plus self-metered delta, only once a calibration has taught us a rate. */
-  private estimateFrom(anchorPercent: number): Reading | null {
-    if (this.percentPerToken === null) return null;
-    const spent = this.selfMeteredTokens - this.anchorTokens;
+  /**
+   * Anchor plus self-metered delta for one window, using that window's own anchor and its own
+   * learned rate. Never mixes: Sol's pass 3 finding 3 was a stale file percentage being projected
+   * from a live reading's token anchor, which reported eighty percent headroom where the matching
+   * live projection said fifty.
+   */
+  private estimate(window: keyof UsageWindows, now: number = Date.now()): Reading | null {
+    const anchor = this.anchors[window];
+    const rate = this.rates[window];
+    if (!anchor || rate === null) return null;
+    const spent = this.meteredIn(windowLength(window), now) - anchor.tokens;
+    if (spent < 0) return null; // the window rolled under the anchor; there is nothing honest to project
     return {
-      percent: Math.max(0, anchorPercent + spent * this.percentPerToken),
+      percent: clampPercent(anchor.percent + spent * rate),
       resetsAt: null,
       source: 'anchor_plus_delta',
       confidence: 'estimated',
@@ -352,28 +453,61 @@ export class Gauge {
   /**
    * S2's calibration plan: compare what we would have reported against the fresh official number,
    * log the gap, and let the gap train the tokens-to-percent rate for the next estimate.
+   *
+   * The guards are the point. A rate is only learned from a movement that could plausibly have been
+   * caused by the tokens metered against it; anything else is logged as rejected with its reason,
+   * so a number nobody can account for never quietly becomes the basis of a later estimate.
    */
-  private calibrate(fresh: Reading): void {
+  private calibrate(window: keyof UsageWindows, fresh: Reading, now: number = Date.now()): void {
     if (fresh.percent === null) return;
-    const tokens = this.selfMeteredTokens;
+    const tokens = this.meteredIn(windowLength(window), now);
+    const anchor = this.anchors[window];
+    const bucketId = window === 'fiveHour' ? 'session_5h' : 'weekly_all';
 
-    if (this.anchorPercent !== null) {
-      const predicted = this.estimateFrom(this.anchorPercent)?.percent ?? this.anchorPercent;
-      const spent = tokens - this.anchorTokens;
+    if (anchor) {
+      const spent = tokens - anchor.tokens;
+      const rate = this.rates[window];
+      const predicted = rate !== null && spent >= 0 ? clampPercent(anchor.percent + spent * rate) : anchor.percent;
+      const candidate = spent > 0 ? (fresh.percent - anchor.percent) / spent : null;
+
+      let rejectedReason: string | null = null;
+      if (spent < MIN_TOKENS_TO_CALIBRATE) {
+        rejectedReason = `only ${spent} tokens metered since the last anchor, which is too few to attribute a move to`;
+      } else if (candidate === null || candidate < 0) {
+        rejectedReason = 'the official percentage fell while tokens were spent, so the window rolled rather than the rate changing';
+      } else if (candidate === 0) {
+        // Spending tokens always costs something. A flat percentage means the official number is
+        // rounded coarsely enough to hide the move, and learning zero from it would freeze every
+        // later estimate at the anchor no matter how much was spent.
+        rejectedReason = 'the official percentage did not move at all, so rounding hid the cost rather than there being none';
+      } else if (candidate > MAX_PERCENT_PER_TOKEN) {
+        rejectedReason = `a rate of ${candidate} percent per token is not physically plausible`;
+      }
+
+      const accepted = rejectedReason === null && candidate !== null;
       logEvent(this.config, {
         kind: 'calibration',
         account: this.account,
-        bucketId: 'session_5h',
+        bucketId,
         predictedPercent: round2(predicted),
         officialPercent: round2(fresh.percent),
         gap: round2(fresh.percent - predicted),
-        fetchedAt: new Date().toISOString(),
+        fetchedAt: new Date(now).toISOString(),
+        accepted,
+        ...(rejectedReason ? { rejectedReason } : {}),
+        ...(accepted && candidate !== null ? { learnedPercentPerToken: candidate } : {}),
       });
-      if (spent > 0) this.percentPerToken = (fresh.percent - this.anchorPercent) / spent;
+      if (accepted && candidate !== null) this.rates[window] = candidate;
     }
 
-    this.anchorPercent = fresh.percent;
-    this.anchorTokens = tokens;
+    this.anchors[window] = { percent: fresh.percent, tokens, at: now, source: fresh.source };
+  }
+
+  /** Samples older than the widest window can never count towards any window again. */
+  private prune(now: number): void {
+    const from = now - WEEK_MS;
+    if (this.samples.length > 0 && this.samples[0]!.at >= from) return;
+    this.samples = this.samples.filter((s) => s.at >= from);
   }
 
   private logReading(bucketId: string, reading: Reading): void {
@@ -389,16 +523,31 @@ export class Gauge {
   }
 }
 
-function describe(reading: Reading): string {
+function windowLength(window: keyof UsageWindows): number {
+  return window === 'fiveHour' ? FIVE_HOUR_MS : WEEK_MS;
+}
+
+/**
+ * The label. One phrase per state, and no two states share one: a reader who sees "official, live"
+ * is entitled to believe the number came from Anthropic in the last little while, so every other
+ * case has to say something else.
+ */
+export function describe(reading: Reading): string {
   if (reading.percent === null) return 'no reading yet';
   const label =
     reading.source === 'official_live'
-      ? 'official, live'
+      ? reading.confidence === 'fresh'
+        ? 'official, live'
+        : 'official, live reading has gone stale'
       : reading.source === 'official_file'
-        ? reading.confidence === 'stale'
-          ? 'official but stale'
-          : 'official, from disk'
-        : 'estimated';
+        ? reading.confidence === 'fresh'
+          ? 'official, from disk'
+          : reading.confidence === 'unknown'
+            ? 'official, from disk, age unknown'
+            : 'official but stale'
+        : reading.source === 'anchor_plus_delta'
+          ? 'estimated from the last official reading'
+          : 'estimated';
   const reset = reading.resetsAt ? `, resets ${shortTime(reading.resetsAt)}` : '';
   return `${round(reading.percent)}% used (${label}${reset})`;
 }
@@ -411,10 +560,19 @@ function shortTime(iso: string): string {
 function windowReading(raw: unknown, source: ReadingSource, confidence: Confidence): Reading {
   if (!isRecord(raw)) return ABSENT_READING;
   const utilization = raw['utilization'];
-  const percent = typeof utilization === 'number' && Number.isFinite(utilization) ? utilization : null;
+  // Finite was not enough: a malformed -5 rendered as "-5% used", which is a claim of 105% headroom.
+  // A percentage outside its own range is not a reading, so it degrades to no reading at all.
+  const percent =
+    typeof utilization === 'number' && Number.isFinite(utilization) && utilization >= 0 && utilization <= 100
+      ? utilization
+      : null;
   const resets = raw['resets_at'];
   if (percent === null) return ABSENT_READING;
   return { percent, resetsAt: typeof resets === 'string' ? resets : null, source, confidence };
+}
+
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
 }
 
 function withTimeout<T>(promise: Promise<T>): Promise<T> {

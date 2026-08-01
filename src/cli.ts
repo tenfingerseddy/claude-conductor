@@ -6,8 +6,10 @@
 
 import { createInterface } from 'node:readline';
 import { WebSocket } from 'ws';
+import { loadConfig } from './config.ts';
 import { runDaemon } from './main.ts';
 import { serverBaseUrl, serverPort, BIND_HOST } from './server/http.ts';
+import { readDaemonToken, tokenPath } from './state/token.ts';
 
 const USAGE = `conductor <command>
 
@@ -17,9 +19,27 @@ const USAGE = `conductor <command>
   add <prompt> --cwd <dir>     queue a task
        [--account <name>] [--trust attended|autonomous] [--model <model>] [--title <text>]
   run                          start working the pending list
+  stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
 `;
+
+/**
+ * The daemon's token, read from the state root. This is the whole of the CLI's authentication:
+ * being able to read a file in the user's own state root is the credential, which is the same
+ * thing being able to reach a loopback port used to be, only true this time.
+ */
+function daemonToken(): string {
+  const config = loadConfig();
+  const token = readDaemonToken(config);
+  if (!token) {
+    throw new Error(
+      `no daemon token at "${tokenPath(config)}". Start the daemon with "conductor daemon", and ` +
+        `check CONDUCTOR_HOME points at the same state root the daemon is using.`,
+    );
+  }
+  return token;
+}
 
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -36,6 +56,8 @@ async function main(argv: string[]): Promise<number> {
       return await addTask(rest);
     case 'run':
       return await startRun();
+    case 'stop':
+      return await stopDaemon();
     case 'tail':
       return await tail(rest[0]);
     case 'watch':
@@ -140,6 +162,21 @@ async function startRun(): Promise<number> {
   return 0;
 }
 
+/**
+ * The programmatic shutdown. Windows cannot deliver SIGINT to a child process, so anything that
+ * starts the daemon and later wants it stopped needs this rather than a signal, and the daemon logs
+ * `daemon_stop` on the way out instead of dying silently.
+ */
+async function stopDaemon(): Promise<number> {
+  const response = asRecord(await post('/stop', {}));
+  if (response['stopping'] !== true) {
+    out(`conductor: ${String(response['error'] ?? 'the daemon did not accept the stop')}`);
+    return 1;
+  }
+  out('daemon stopping.');
+  return 0;
+}
+
 async function tail(countArg: string | undefined): Promise<number> {
   const count = Number(countArg ?? '20');
   const response = asRecord(await get(`/events?tail=${Number.isFinite(count) && count > 0 ? Math.floor(count) : 20}`));
@@ -155,7 +192,8 @@ async function tail(countArg: string | undefined): Promise<number> {
  * saying anything but yes, denies.
  */
 async function watch(): Promise<number> {
-  const socket = new WebSocket(`ws://${BIND_HOST}:${serverPort()}/ws`);
+  // The token rides in a header, which is exactly why a browser cannot open this socket.
+  const socket = new WebSocket(`ws://${BIND_HOST}:${serverPort()}/ws`, { headers: { authorization: `Bearer ${daemonToken()}` } });
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   let asking: Promise<void> = Promise.resolve();
 
@@ -171,6 +209,12 @@ async function watch(): Promise<number> {
   socket.on('message', (data) => {
     const event = asRecord(safeParse(String(data)));
     if (event['type'] === 'approval_request') {
+      // An approval is addressed to one door. A watcher that is not the addressee sees the question
+      // and says so, rather than prompting for an answer the daemon would refuse.
+      if (event['yours'] === false) {
+        out(`  (a tap is waiting at ${String(event['door'])}, not at this window: ${String(event['toolName'])})`);
+        return;
+      }
       // Serialised: two stops must not fight over stdin.
       asking = asking.then(() => askApproval(socket, rl, event));
       return;
@@ -303,10 +347,13 @@ async function post(path: string, body: unknown): Promise<unknown> {
 
 async function call(method: string, path: string, body?: unknown): Promise<unknown> {
   let response: Response;
+  const headers: Record<string, string> = { authorization: `Bearer ${daemonToken()}` };
+  if (body !== undefined) headers['content-type'] = 'application/json';
   try {
     response = await fetch(`${serverBaseUrl()}${path}`, {
       method,
-      ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+      headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch (err) {
     throw new Error(`could not reach the daemon at ${serverBaseUrl()}. Start it with "conductor daemon". (${err instanceof Error ? err.message : String(err)})`);

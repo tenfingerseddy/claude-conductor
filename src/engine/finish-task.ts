@@ -37,6 +37,13 @@ export function createFinishTaskServer(
   taskTitle: string,
   onFinish: (call: FinishTaskCall) => void,
 ) {
+  // One task, one handoff. Sol's pass 2 finding 2: the guard used to live in the runner's onFinish
+  // callback, which runs *after* the note is on disk, so a second call in the same response wrote a
+  // second note and only then had it discarded. Two notes on disk, one of them orphaned, and a tool
+  // result telling the model its second handoff had been recorded. The claim is taken here, before
+  // anything is written, which is what makes the tool idempotent rather than merely deduplicated.
+  let claimed: FinishTaskCall | null = null;
+
   const finishTask = tool(
     'finish_task',
     DESCRIPTION,
@@ -56,6 +63,20 @@ export function createFinishTaskServer(
         .describe('Tasks that should be queued next. One clear instruction each.'),
     },
     async (args) => {
+      if (claimed) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `This task was already handed off with outcome ${claimed.outcome}` +
+                `${claimed.handoffPath ? ` to "${claimed.handoffPath}"` : ''}. Nothing was written for this ` +
+                `second call and the first handoff stands. Conductor is cutting the context now; end your turn.`,
+            },
+          ],
+        };
+      }
+
       const handoff: Handoff = {
         task: taskTitle,
         whatWasDone: args.what_was_done,
@@ -63,8 +84,13 @@ export function createFinishTaskServer(
         openThreads: args.open_threads ?? [],
         followUps: args.follow_up_tasks ?? [],
       };
+      // Claimed before the write, so a second call that arrives while this one is still in the
+      // handler finds the claim taken rather than racing it to disk.
+      const call: FinishTaskCall = { outcome: args.outcome, handoff, handoffPath: null, followUps: handoff.followUps };
+      claimed = call;
       const handoffPath = writeHandoff(config, handoff);
-      onFinish({ outcome: args.outcome, handoff, handoffPath, followUps: handoff.followUps });
+      call.handoffPath = handoffPath;
+      onFinish(call);
 
       return {
         content: [
