@@ -4,8 +4,8 @@ Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says wh
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 in progress. S1 green, S2 amber, S3 green, S4 green. S5 running (restarted after a
-laptop sleep).** Last updated 2026-08-01.
+Status: **M0 complete. S1 green, S2 amber, S3 green, S4 green, S5 amber. Both ambers carry
+written fallbacks, so M1 begins per D1.** Last updated 2026-08-01.
 
 ## How to read this file
 
@@ -151,14 +151,30 @@ Highest value. Blocks everything.
 
 ### S5, Windows service ergonomics
 
-- [ ] Auto-start at login on Windows 11, without admin rights if possible.
-- [ ] Keep-awake while sessions run, and released when they stop.
-- [ ] Bind a server to the Tailscale interface only, and prove nothing else is listening.
+- [x] Auto-start at login on Windows 11, without admin rights if possible.
+- [x] Keep-awake while sessions run, and released when they stop.
+- [x] Bind a server to the Tailscale interface only, and prove nothing else is listening.
 - Verdict file: `docs/spikes/s5-windows.md`
-- Evidence:
+- Evidence: **Amber.** All three work without admin, each with a caveat. Auto-start: PowerShell
+  `Register-ScheduledTask` at logon works for a standard user on this Azure AD machine while
+  `schtasks.exe` and raw COM are denied, so the installer must use the cmdlet; a `wscript` VBS
+  wrapper is load-bearing to avoid a visible console window; HKCU Run key is the fallback.
+  Keep-awake: `SetThreadExecutionState` from a PowerShell child, proven by the API's own return
+  values since `powercfg /requests` needs admin; refcount and release on last session end; ~89 MB
+  holder cost suggests an in-process binding at M1; Modern Standby means it beats the idle timer
+  but not a lid close. Tailscale bind: single-address `listen` proven (nothing on 0.0.0.0 or
+  loopback, other interfaces refused), `EADDRNOTAVAIL` is the down-interface failure mode and the
+  daemon must keep the loopback door and retry rather than widen. Caveat: Tailscale on this
+  machine is in NoState with no IP, so the bind was proven as a technique, not against a live
+  Tailscale address. All test artifacts were removed.
 
 **M0 finish line:** five verdict files exist, all green or amber with a written fallback. Kane
 reads the summary. If S1 is red, this run ends here per D8.
+
+**M0 closed 2026-08-01.** S1 green, S2 amber, S3 green, S4 green, S5 amber. No reds. Fallbacks:
+S2's staleness is covered by the gauge source stack in the decisions log; S5's caveats are
+recorded in its evidence and the Tailscale live-bind check is parked until Kane runs
+`tailscale up` (needed before M5, not before M1).
 
 ## M1, engine
 
@@ -253,6 +269,8 @@ Things not settled. Add to this list rather than guessing.
   to file read plus self-metering without erroring.
 - The two accounts have different bucket shapes: work has usage credits enabled with a monthly
   limit, personal has them disabled. The cross-account gauge cannot assume one layout.
+- Tailscale is installed but in NoState with no IP on this machine. The live Tailscale bind check
+  from S5 re-runs once Kane logs Tailscale in. Blocks M5 only.
 
 ## Decisions log
 
