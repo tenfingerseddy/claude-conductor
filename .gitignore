@@ -1,0 +1,8 @@
+node_modules/
+
+# Conductor state lives outside the repo (%USERPROFILE%\.conductor). These patterns are a
+# backstop so no state, logs, or handoffs can ever be committed even if that changes.
+*.jsonl
+handoffs/
+.conductor/
+.env
