@@ -300,7 +300,11 @@ src/
       mechanically demonstrated, 2 parked (handoff disk recovery and follow-up queueing, both
       belong to M2's durable queue), none contested. Closure table with evidence per finding in
       `docs/notes/m1-fixslice-findings.md`. Box closes when the Sol re-check passes.
-- [ ] Sol re-check of the security fixes (one pass, diff-focused).
+- [x] Sol re-check of the security fixes (one pass, diff-focused). **Failed**, eight findings,
+      only one pass 1 item closed on its own terms. Raw output and triage:
+      `docs/notes/sol-review-m1-recheck.md`. Merge blocked; fix round 2 below.
+- [ ] Fix round 2: close the re-check findings under the v1 threat model, then a final Sol pass
+      on the classifier alone.
 - [ ] Merge to main.
 - Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
   and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
@@ -422,6 +426,19 @@ Append here when a design call is made during the build. Date, decision, reason,
   risky: approval in attended, denied in autonomous. Reason: Sol showed interpreter wrappers walk
   through any blocklist; a list of bad strings can never be complete, a list of vouched-safe
   shapes can be honest. D9 stands unweakened.
+- 2026-08-01. v1 threat model written down (architect call after the Sol re-check): Conductor
+  defends against a hostile page reaching loopback and against the model misusing tools. It does
+  NOT defend against a hostile process already running as Kane's user, because such a process can
+  read Claude Code's own credential files directly and owns the account regardless of anything
+  Conductor does; OS-level user isolation is the real boundary there. Sol's token-hardening
+  findings that assume a same-user attacker (token file readable, hard links, icacls fail-open)
+  are parked under this call, revisit if Conductor ever runs multi-user.
+- 2026-08-01. Interpreters are never vouched safe, no exceptions (architect call closing the
+  re-check's worst hole). `node x.js`, `python`, `deno`, anything that executes a file the
+  session can write, is always risky: tap in attended, denied in autonomous. Vouched-safe shell
+  shapes shrink to bare known command names only (no paths, no .cmd/.bat/.ps1 resolution, no
+  redirection, arguments checked against per-command safe-flag lists). Convenience lost is the
+  price of a rail that means something.
 - 2026-08-01. First real queue content after M1 merges: the assessment program in nexwave-apps
   (`assessment-program/VISION.md`). Blocked on Kane answering the five blocking questions in
   `assessment-program/QUESTIONS.md`; the vision then goes to Sol per its own header before an
