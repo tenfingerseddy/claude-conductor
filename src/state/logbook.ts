@@ -43,10 +43,20 @@ export type ConductorEvent =
       head: string | null;
       detached: boolean;
       files: number;
+      /** Ref pinning the blob that lists what .gitignore covered when the checkpoint was taken. */
+      ignoredRef?: string | null;
+      /** A merge or rebase paused when the checkpoint was taken. Recorded, never restored. */
+      inProgress?: 'merge' | 'rebase' | null;
     }
   // No before-image was taken, so no task ran. A refusal is logged as loudly as a checkpoint,
   // because "nothing was captured" is the fact a later reader most needs.
   | { kind: 'checkpoint_refused'; taskId: string; cwd: string; reason: string }
+  // The task-end image. Pairs with the checkpoint above to make provenance a recorded fact rather
+  // than something undo infers: checkpoint..post-image is the task's work, post-image..now is not.
+  | { kind: 'postimage'; taskId: string; ref: string; commit: string; tree: string; repoRoot: string }
+  // No post-image, so provenance is unknown and undo refuses the blanket case. Logged rather than
+  // swallowed, because this is the line that explains the refusal later.
+  | { kind: 'postimage_failed'; taskId: string; reason: string }
   | {
       kind: 'undo';
       taskId: string;
@@ -54,8 +64,14 @@ export type ConductorEvent =
       commit: string;
       repoRoot: string;
       cwd: string;
+      /** Whether the plan knew the task's own changes, or could only see checkpoint against now. */
+      provenance?: 'post-image' | 'unknown';
+      /** True when a human explicitly asked to touch changes the task did not make. */
+      override?: boolean;
       restored: number;
       deleted: number;
+      /** Differences left alone because somebody other than the task made them. */
+      heldBack?: number;
       outsideLeftAlone: number;
       failures: number;
     }

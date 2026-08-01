@@ -5,6 +5,12 @@ default rests on, so the verification below is the point of the document and the
 supporting detail. Every transcript is raw output from a run, pasted whole. All git work happened in
 throwaway repositories under the session scratchpad; no real project was touched.
 
+**Superseded in part.** Sol reviewed this slice and found it unsafe to merge. Four blocking defects
+were fixed afterwards, and the fix round is written up in
+[`m2-sliceA-fix-findings.md`](m2-sliceA-fix-findings.md). Read that alongside this. The limits list
+below has been rewritten as part of that round; the transcripts below are the original run and are
+left as they were, so the preview text they show is the old wording.
+
 ## What landed
 
 - `src/engine/checkpoint.ts`. Before every task in a git project, the whole working tree, including
@@ -22,23 +28,57 @@ throwaway repositories under the session scratchpad; no real project was touched
 
 ## Limits, stated rather than skipped
 
+Revised 2026-08-01 after Sol's review. The first version of this list had two entries and read as
+though it were the whole story. It was not. **This list is the known limits, not all of them.** The
+checkpoint is an image of the working tree taken by ordinary git plumbing, and anything git does not
+put in a tree object is outside it. Where a limit can be detected cheaply, the preview now names it
+in the run where it applies rather than leaving it here to be found later.
+
 1. **Ignored files are not in the before-image.** `git add -A` honours `.gitignore`, so build output
-   and anything else ignored is not checkpointed and is therefore not restorable. Undo also never
-   deletes an ignored file, so the rule is at least consistent, and the preview says so in plain
-   words every time. Test 2 below shows an ignored file surviving an undo unchanged.
-2. **`.gitattributes` text declarations still normalise content.** Conductor turns off
-   `core.autocrlf` for its own git calls (see below), which fixes the common case. It cannot turn off
-   an in-tree `.gitattributes`, so a file whose bytes on disk disagree with what its attributes
-   declare comes back converted. Test 8 probes this deliberately and shows it failing, rather than
-   leaving it for someone to discover later.
-3. **File modes and symlinks** are restored by `git checkout-index`, which is correct on POSIX and
-   largely moot on Windows. Not separately verified here; Windows is the first-class platform and a
-   symlinked working tree was out of scope for this slice.
-4. **A staged change that no longer exists in the working tree is not captured.** The checkpoint is
+   and anything else ignored is not checkpointed and is therefore not restorable. Undo never deletes
+   an ignored file either, and that promise now holds even when the task edits `.gitignore`: the
+   ignore set is recorded at checkpoint time and read back verbatim. Test 2 below shows an ignored
+   file surviving an undo unchanged; R4 in the fix findings shows the changed-`.gitignore` case.
+2. **The index, HEAD, refs, and a paused merge or rebase are outside the before-image.** The
+   checkpoint is a working-tree image and nothing else. The user's own index is never read or
+   written, which is why `git status` is unchanged by a checkpoint, but the flip side is that staged
+   state, a moved HEAD, a deleted branch or an interrupted merge that the *task* destroyed does not
+   come back. A merge or rebase in progress is detected at checkpoint time and named in the preview.
+3. **`.gitattributes` transforms content, and can hide a difference entirely.** Conductor turns off
+   `core.autocrlf` for its own git calls, which fixes the common case. It cannot turn off an in-tree
+   `.gitattributes`, so `text`, `eol`, `working-tree-encoding`, `ident` and clean or smudge filters
+   still apply. Two consequences, and the second is the worse one: a file can come back converted,
+   and two different working files that clean to the same blob make the preview report nothing to
+   change while the bytes genuinely differ. Test 8 probes both halves. A repository holding a
+   `.gitattributes` is now named in the preview.
+4. **Submodule and embedded-repository contents are not captured.** The checkpoint holds the gitlink,
+   which is the commit the submodule pointed at, not the files inside it. Uncommitted work inside a
+   submodule is neither seen nor restored. Detected and named in the preview when the folder contains
+   one.
+5. **A symlink's referent is not captured.** The link object is checkpointed and restored; whatever
+   it points at is not, so a task that writes through a link damages a file the before-image never
+   held. Detected and named in the preview when the checkpoint contains a symlink. Not verified on
+   this host: creating a symlink needs privileges this account does not have.
+6. **The checkpoint is not a point-in-time snapshot.** `git add -A` walks the working tree while the
+   tree can still be written to, so a concurrent writer can produce a tree that was never the whole
+   working tree at any single instant. The same is true of the gap between the checkpoint returning
+   and the session starting. No cheap fix exists without filesystem snapshots, and it is not
+   detectable, so it is stated here and nowhere else.
+7. **A staged change that no longer exists in the working tree is not captured.** The checkpoint is
    an image of the working tree, which is what undo restores. The user's index is left exactly as it
    was, so nothing is lost, but undo will not reconstruct a staged-then-deleted file.
-5. **Checkpoint refs are never pruned.** One ref per task accumulates in the repository. They are
-   cheap and no branch references them, but a later slice should age them out.
+8. **`core.fileMode=false` records the wrong mode.** On POSIX with that setting, the scratch index
+   keeps HEAD's mode rather than the working tree's, so an executable bit set before the task is not
+   restored. Low priority on a Windows-first project, and untested here for the same reason.
+9. **Checkpoint refs are never pruned.** Three refs per task now accumulate: the checkpoint, the
+   post-image and the pinned ignore set. They are cheap and no branch references them, but a later
+   slice should age them out.
+10. **Task ids repeat across daemon restarts.** `nextId` resets to 1, so a second `t1` overwrites the
+    first `t1`'s refs and the older checkpoint becomes unreachable. Undo finds the newest one. Real,
+    and it belongs to the queue rather than to this file.
+11. **Undo is not atomic.** It deletes, then restores, and either half can fail part way. The counts
+    and the failure list now describe what actually happened rather than assuming all or nothing, but
+    a failure can still leave the folder between two states.
 
 ## Two bugs found by the verification, both fixed
 

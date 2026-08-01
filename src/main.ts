@@ -8,7 +8,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveAccount, usableAccounts, type Config } from './config.ts';
-import { checkpointTask } from './engine/checkpoint.ts';
+import { checkpointTask, postImageTask } from './engine/checkpoint.ts';
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
 import { Gauge } from './engine/gauge.ts';
@@ -130,14 +130,24 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
       });
       options.onTaskStart?.(task);
 
-      const result = await runSession(config, task, {
-        configDir: account.configDir,
-        gauge,
-        openingPrompt: buildOpeningPrompt(task.prompt, carry),
-        ...(options.onMessage ? { onMessage: (message: SDKMessage) => options.onMessage?.(task.id, message) } : {}),
-        ...(options.approve ? { approve: options.approve } : {}),
-        ...(options.onHandle ? { onHandle: options.onHandle } : {}),
-      });
+      // The post-image, taken the moment the session stops for any reason. checkpoint..post-image is
+      // what the task did; post-image..now is what a human did afterwards. Without it undo can only
+      // diff the checkpoint against the present and guess which is which, which is how it came to
+      // delete somebody's later work and call it the task's. In a `finally`, because a task that
+      // crashes is exactly the one whose damage most needs attributing.
+      let result;
+      try {
+        result = await runSession(config, task, {
+          configDir: account.configDir,
+          gauge,
+          openingPrompt: buildOpeningPrompt(task.prompt, carry),
+          ...(options.onMessage ? { onMessage: (message: SDKMessage) => options.onMessage?.(task.id, message) } : {}),
+          ...(options.approve ? { approve: options.approve } : {}),
+          ...(options.onHandle ? { onHandle: options.onHandle } : {}),
+        });
+      } finally {
+        postImageTask(config, checkpoint.record);
+      }
 
       const finish: FinishTaskCall | null = result.finish;
       // A session that ends without finish_task did not hand off, and three things follow from

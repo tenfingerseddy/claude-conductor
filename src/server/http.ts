@@ -25,7 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { loadConfig, usableAccounts, type Config } from '../config.ts';
-import { applyUndo, checkpointRefusal, describePlan, findCheckpoint, previewUndo } from '../engine/checkpoint.ts';
+import { applyUndo, checkpointRefusal, describePlan, findCheckpoint, planFingerprint, previewUndo, type UndoPlan } from '../engine/checkpoint.ts';
 import { Gauge } from '../engine/gauge.ts';
 import type { Carry } from '../engine/cut.ts';
 import { trustRefusal, type ApprovalOutcome, type ApprovalRequest, type SessionHandle, type Task, type Trust } from '../engine/session.ts';
@@ -84,6 +84,16 @@ interface PendingApproval {
 const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 // What a late-joining door gets replayed. Small on purpose: the logbook is the real history.
 const RECENT_LIMIT = 50;
+// How long a previewed undo plan stays confirmable. Long enough to read a file list, short enough
+// that a plan cannot be confirmed against a working tree that has moved on since.
+const UNDO_PLAN_TTL_MS = 5 * 60 * 1000;
+
+/** A previewed plan, held so the confirming call applies that list and not a freshly guessed one. */
+interface StoredUndoPlan {
+  plan: UndoPlan;
+  hash: string;
+  createdAt: number;
+}
 
 class Daemon {
   readonly config: Config;
@@ -96,6 +106,8 @@ class Daemon {
   /** Ids already answered. An approval is single-use; a replayed id is refused, not re-run. */
   private readonly spentApprovals = new Set<string>();
   private readonly recent: unknown[] = [];
+  /** Previewed undo plans, by plan id. Single use, and they expire. */
+  private readonly undoPlans = new Map<string, StoredUndoPlan>();
   private running = false;
   private currentTaskId: string | null = null;
   private handle: SessionHandle | null = null;
@@ -387,40 +399,85 @@ class Daemon {
    * Undo, the other half of the checkpoint. Two calls by design: the first returns the preview and
    * changes nothing, the second carries `confirm: true` and does the work. Undo is destructive in
    * its own right, so a single call that both describes and performs would be the wrong shape.
+   *
+   * Sol's finding 3 was that the two-call shape did not actually enforce any of that: the confirming
+   * call computed its own plan and applied that one, and a first-and-only call carrying
+   * `confirm: true` was accepted, so what executed had never been shown to anybody. Consent is to a
+   * specific list of paths, so the preview now hands back a `planId` and a `planHash`, confirming
+   * must present both, and the daemon applies the stored plan. No prior preview, a hash that does
+   * not match, or a plan that has expired are all refusals.
    */
   undo(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
     if (this.running) {
       return { status: 409, payload: { error: 'a run is in progress; stop it before undoing, or the undo and the task will fight over the same files' } };
     }
+    return body['confirm'] === true ? this.applyPreviewedUndo(body) : this.previewUndoPlan(body);
+  }
+
+  private previewUndoPlan(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
     const taskId = typeof body['taskId'] === 'string' && body['taskId'].trim() ? body['taskId'].trim() : undefined;
     const record = findCheckpoint(this.config, taskId);
     if (!record) {
       return { status: 404, payload: { error: taskId ? `no checkpoint was recorded for task "${taskId}"` : 'no checkpoint has been recorded yet' } };
     }
 
-    const preview = previewUndo(this.config, record);
+    const preview = previewUndo(this.config, record, { overrideChangedAfterTask: body['overrideChangedAfterTask'] === true });
     if (!preview.ok) return { status: 409, payload: { error: preview.reason, taskId: record.taskId, ref: record.ref } };
 
     const plan = preview.plan;
-    const base = {
-      taskId: record.taskId,
-      ref: record.ref,
-      commit: record.commit,
-      cwd: record.cwd,
-      repoRoot: record.repoRoot,
-      changes: plan.changes,
-      outsideTaskFolder: plan.outsideCount,
-      preview: describePlan(plan),
-    };
+    const hash = planFingerprint(plan);
+    const planId = randomBytes(12).toString('hex');
+    this.pruneUndoPlans();
+    this.undoPlans.set(planId, { plan, hash, createdAt: Date.now() });
 
-    if (body['confirm'] !== true) {
-      return { status: 200, payload: { ...base, applied: false, note: 'nothing was changed. Send the same request with "confirm": true to apply it.' } };
+    return {
+      status: 200,
+      payload: {
+        ...undoBase(plan),
+        planId,
+        planHash: hash,
+        expiresInSeconds: Math.round(UNDO_PLAN_TTL_MS / 1000),
+        applied: false,
+        note:
+          plan.changes.length === 0
+            ? 'nothing would be changed.'
+            : 'nothing was changed. Send "confirm": true with this planId and planHash to apply exactly this list.',
+      },
+    };
+  }
+
+  private applyPreviewedUndo(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
+    this.pruneUndoPlans();
+    const planId = typeof body['planId'] === 'string' ? body['planId'].trim() : '';
+    const planHash = typeof body['planHash'] === 'string' ? body['planHash'].trim() : '';
+    if (!planId || !planHash) {
+      return {
+        status: 400,
+        payload: { error: 'confirming an undo needs the planId and planHash from a preview. Ask for the preview first and confirm the list it returns.' },
+      };
     }
-    if (plan.changes.length === 0) return { status: 200, payload: { ...base, applied: false, note: 'nothing to change.' } };
+    const stored = this.undoPlans.get(planId);
+    if (!stored) {
+      return { status: 409, payload: { error: 'that undo plan is unknown or has expired. Ask for a fresh preview and confirm that one.' } };
+    }
+    if (stored.hash !== planHash) {
+      return { status: 409, payload: { error: 'the planHash does not match the stored plan, so the list being confirmed is not the list that was previewed.' } };
+    }
+    // Single use. A confirmed plan is spent whether it applied cleanly or not, so nothing can be
+    // replayed against a working tree it no longer describes.
+    this.undoPlans.delete(planId);
+
+    const plan = stored.plan;
+    if (plan.changes.length === 0) return { status: 200, payload: { ...undoBase(plan), applied: false, note: 'nothing to change.' } };
 
     const outcome = applyUndo(this.config, plan);
-    this.broadcast({ type: 'undo', taskId: record.taskId, ref: record.ref, restored: outcome.restored, deleted: outcome.deleted });
-    return { status: 200, payload: { ...base, applied: true, restored: outcome.restored, deleted: outcome.deleted, failures: outcome.failures } };
+    this.broadcast({ type: 'undo', taskId: plan.record.taskId, ref: plan.record.ref, restored: outcome.restored, deleted: outcome.deleted });
+    return { status: 200, payload: { ...undoBase(plan), applied: true, restored: outcome.restored, deleted: outcome.deleted, failures: outcome.failures } };
+  }
+
+  private pruneUndoPlans(): void {
+    const cutoff = Date.now() - UNDO_PLAN_TTL_MS;
+    for (const [id, stored] of this.undoPlans) if (stored.createdAt < cutoff) this.undoPlans.delete(id);
   }
 
   private defaultAccount(): string | null {
@@ -458,6 +515,25 @@ class Daemon {
       // A door that cannot be written to is a door that has gone; never let it break the run.
     }
   }
+}
+
+/** The parts of an undo response that read the same whether it was previewed or applied. */
+function undoBase(plan: UndoPlan): Record<string, unknown> {
+  return {
+    taskId: plan.record.taskId,
+    ref: plan.record.ref,
+    commit: plan.record.commit,
+    cwd: plan.record.cwd,
+    repoRoot: plan.record.repoRoot,
+    changes: plan.changes,
+    held: plan.held,
+    provenance: plan.provenance,
+    override: plan.override,
+    caseCollisions: plan.caseCollisions,
+    ignoredSkipped: plan.ignoredSkipped.length,
+    outsideTaskFolder: plan.outsideCount,
+    preview: describePlan(plan),
+  };
 }
 
 /** A task that never handed off is aborted, which is neither done nor an error the model raised. */

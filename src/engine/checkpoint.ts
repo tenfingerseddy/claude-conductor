@@ -13,16 +13,34 @@
 //
 // Every git call is an argument array through spawnSync with no shell, so nothing re-parses a
 // string after we have written it. That is the same lesson the rail learned the expensive way.
+//
+// Sol's review of the first cut named the flaw that shaped the rest of this file: the before-image
+// was honest, but the plan built from it *guessed* at provenance and the preview asserted that guess
+// as fact. A diff of "checkpoint versus now" cannot tell the task's work from a human edit made
+// afterwards, so undo would happily destroy the human's edit and call it "created by the task".
+// Guessing better is not a fix. Three recorded facts replace the guess:
+//
+//   1. A **post-image**, taken when the task finishes, under refs/conductor/postimage/<taskId>.
+//      checkpoint..post-image is what the task did. post-image..now is what somebody else did after
+//      it. Provenance becomes something Conductor knows rather than something it infers.
+//   2. The **ignore set at checkpoint time**, stored as a blob and pinned by its own ref. Undo asks
+//      that recorded set what .gitignore covered, never the current .gitignore, so a task that edits
+//      .gitignore cannot widen what undo is allowed to delete.
+//   3. A **plan fingerprint**, so the list a human approved is the list that executes.
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Config } from '../config.ts';
 import { logEvent } from '../state/logbook.ts';
 
 /** Where Conductor's checkpoints live. Not under refs/heads, so `git branch` never shows them. */
 export const REF_PREFIX = 'refs/conductor/checkpoints/';
+/** The task-end image. Same plumbing, same invisibility; the other half of provenance. */
+export const POSTIMAGE_REF_PREFIX = 'refs/conductor/postimage/';
+/** Pins the recorded ignore-set blob so git gc cannot collect the answer undo depends on. */
+export const IGNORED_REF_PREFIX = 'refs/conductor/ignored/';
 
 /**
  * Line-ending conversion turned off for the two commands that move file content.
@@ -35,8 +53,10 @@ export const REF_PREFIX = 'refs/conductor/checkpoints/';
  * These `-c` overrides apply to Conductor's own git calls only. They do not touch the user's config
  * and the checkpoint commit never joins the user's history, so storing raw bytes rather than
  * normalised ones costs nothing. Known limit, stated rather than hidden: a repository whose
- * `.gitattributes` declares `text` for a file still gets that file normalised on the way in, so the
- * round trip is exact only when the file on disk already matches what its attributes declare.
+ * `.gitattributes` declares `text`, `working-tree-encoding`, `ident` or a clean/smudge filter for a
+ * file still gets that file transformed on the way in, and two different working files can clean to
+ * one blob, which makes the difference invisible rather than merely lossy. See the limits list in
+ * docs/notes/m2-sliceA-findings.md.
  */
 const NO_EOL_CONVERSION = ['-c', 'core.autocrlf=false', '-c', 'core.eol=lf', '-c', 'core.safecrlf=false'];
 
@@ -47,6 +67,13 @@ const COMMIT_IDENTITY = {
   GIT_COMMITTER_NAME: 'Conductor',
   GIT_COMMITTER_EMAIL: 'conductor@localhost',
 };
+
+/** The task-end image of the same working tree. Absent when a task died before it could be taken. */
+export interface PostImage {
+  ref: string;
+  commit: string;
+  tree: string;
+}
 
 export interface CheckpointRecord {
   taskId: string;
@@ -61,6 +88,12 @@ export interface CheckpointRecord {
   head: string | null;
   detached: boolean;
   files: number;
+  /** Ref pinning the blob that lists what .gitignore covered when the checkpoint was taken. */
+  ignoredRef: string | null;
+  /** A half-finished merge or rebase at checkpoint time. Recorded so the preview can say so. */
+  inProgress: 'merge' | 'rebase' | null;
+  /** Filled in by findCheckpoint from the logbook. Null until the task has finished. */
+  postImage: PostImage | null;
 }
 
 export type CheckpointResult = { ok: true; record: CheckpointRecord } | { ok: false; reason: string };
@@ -70,15 +103,42 @@ export interface UndoChange {
   path: string;
   /** restore: put the checkpoint content back. delete: the task created it, so it goes. */
   action: 'restore' | 'delete';
-  /** modified means it existed at checkpoint time and differs now; missing means the task removed it. */
+  /** modified means it existed at checkpoint time and differs now; missing means it was removed. */
   why: 'modified' | 'missing' | 'created';
+}
+
+/** A change undo will not make on its own, and the reason it is being held back. */
+export interface HeldChange extends UndoChange {
+  /**
+   * changed-after-task: the post-image proves somebody changed this after the task ended.
+   * unknown-provenance: no post-image exists, so nothing here can be attributed to the task.
+   */
+  held: 'changed-after-task' | 'unknown-provenance';
 }
 
 export interface UndoPlan {
   record: CheckpointRecord;
+  /** Exactly what applyUndo will do. Nothing else is touched. */
   changes: UndoChange[];
   /** Everything outside the task folder that also differs. Named, never touched. */
   outsideCount: number;
+  /** post-image: provenance is known. unknown: the task left no post-image. */
+  provenance: 'post-image' | 'unknown';
+  /** Held back, listed in full in the preview, and only movable by the named override. */
+  held: HeldChange[];
+  /** True when the caller passed the override, which folds `held` into `changes`. */
+  override: boolean;
+  /** Paths whose delete and restore differ only in case, so on Windows they are one file. */
+  caseCollisions: string[];
+  /** Paths .gitignore covered at checkpoint time. Never restored, never deleted. */
+  ignoredSkipped: string[];
+  /**
+   * Limits this particular repository actually hits, detected rather than left to be discovered.
+   * Sol's findings 2, 7, 8 and 9a are all real limits, and the problem with each of them was that
+   * the preview said nothing while the limit applied. A limit named in the preview is a limit; a
+   * limit nobody is told about is a false promise.
+   */
+  notes: string[];
 }
 
 // --- git plumbing ------------------------------------------------------------
@@ -178,7 +238,13 @@ export function checkpointRefusal(cwd: string): string | null {
 
 // --- building a tree from the working tree -----------------------------------
 
-/** A scratch index path in Conductor's own state root. Never inside the user's repository. */
+/**
+ * A scratch index path in Conductor's own state root. Never inside the user's repository, and that
+ * is enforced at startup rather than assumed here: `loadConfig` (src/config.ts) refuses a state root
+ * that sits inside any git checkout, which is also what keeps the daemon token and usage data out of
+ * a repository. Sol's finding 10 read this file alone and reasonably feared a scratch index being
+ * swept up by `git add -A`; the guard it could not see is the reason that cannot happen.
+ */
 function scratchIndex(config: Config, label: string): string {
   const dir = join(config.stateRoot, 'tmp');
   mkdirSync(dir, { recursive: true });
@@ -201,8 +267,11 @@ function discardIndex(path: string): void {
  *
  * Ignored paths are not included, because `git add -A` honours .gitignore. That is deliberate and it
  * is a real limit: build output and anything else in .gitignore is not in the before-image and
- * therefore not restorable by undo. Undo never deletes those files either, so the rule is
- * consistent: what git ignores, Conductor ignores.
+ * therefore not restorable by undo. Undo never deletes those files either, which is why the ignore
+ * set is recorded at checkpoint time rather than re-derived later.
+ *
+ * Not a point-in-time snapshot: `git add -A` walks the tree while the tree can still be written to.
+ * Stated limit, not a fixable one without filesystem snapshots.
  */
 function writeWorktreeTree(repoRoot: string, indexFile: string, head: string | null): { ok: true; tree: string } | { ok: false; reason: string } {
   if (head) {
@@ -230,10 +299,67 @@ function headIsDetached(repoRoot: string): boolean {
   return !git(['symbolic-ref', '--quiet', 'HEAD'], { cwd: repoRoot }).ok;
 }
 
+/**
+ * A merge or rebase paused mid-flight. The checkpoint is a working-tree image and does not capture
+ * it, which is a stated limit; detecting it costs one git call and turns the limit into a sentence
+ * in the preview instead of a surprise.
+ */
+function operationInProgress(repoRoot: string): 'merge' | 'rebase' | null {
+  const gitDir = git(['rev-parse', '--absolute-git-dir'], { cwd: repoRoot }).stdout.trim();
+  if (!gitDir) return null;
+  if (existsSync(join(gitDir, 'rebase-merge')) || existsSync(join(gitDir, 'rebase-apply'))) return 'rebase';
+  if (existsSync(join(gitDir, 'MERGE_HEAD'))) return 'merge';
+  return null;
+}
+
+/** What a checkpoint tree contains that undo cannot fully reproduce. One git call, no guessing. */
+function treeFacts(repoRoot: string, tree: string): { submodules: number; symlinks: number; gitattributes: boolean } {
+  const listed = git(['ls-tree', '-r', '-z', tree], { cwd: repoRoot });
+  const facts = { submodules: 0, symlinks: 0, gitattributes: false };
+  if (!listed.ok) return facts;
+  for (const entry of listed.stdout.split('\0')) {
+    if (!entry) continue;
+    const mode = entry.slice(0, 6);
+    const path = entry.slice(entry.indexOf('\t') + 1);
+    if (mode === '160000') facts.submodules++;
+    else if (mode === '120000') facts.symlinks++;
+    if (path === '.gitattributes' || path.endsWith('/.gitattributes')) facts.gitattributes = true;
+  }
+  return facts;
+}
+
 /** A task id turned into something git will accept as a ref component. */
-export function refFor(taskId: string): string {
+export function refFor(taskId: string, prefix: string = REF_PREFIX): string {
   const safe = taskId.replace(/[^A-Za-z0-9._-]/g, '-').replace(/^[.-]+/, '').replace(/\.lock$/i, '-lock');
-  return `${REF_PREFIX}${safe || 'task'}`;
+  return `${prefix}${safe || 'task'}`;
+}
+
+/**
+ * Records what .gitignore covered at checkpoint time, as a blob pinned by its own ref.
+ *
+ * Sol's finding 6: a task that deletes an ignore rule makes a previously ignored file look, at undo
+ * time, exactly like a file the task created, and undo deletes it. Re-reading the current .gitignore
+ * cannot fix that, because the current .gitignore is the thing the task changed. The set is
+ * therefore captured before the task and read back verbatim afterwards. A ref rather than a bare
+ * hash, so `git gc` cannot collect it out from under a checkpoint that still exists.
+ */
+function captureIgnored(repoRoot: string, taskId: string): string | null {
+  const listed = git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard'], { cwd: repoRoot });
+  if (!listed.ok) return null;
+  // --no-filters: this is a path list, not file content, and no attribute may rewrite it.
+  const blob = git(['hash-object', '--no-filters', '-w', '--stdin'], { cwd: repoRoot, input: listed.stdout });
+  const hash = blob.stdout.trim();
+  if (!blob.ok || !hash) return null;
+  const ref = refFor(taskId, IGNORED_REF_PREFIX);
+  return git(['update-ref', ref, hash], { cwd: repoRoot }).ok ? ref : null;
+}
+
+/** The recorded ignore set, or null when the record is missing, which undo treats as a refusal. */
+function readIgnored(repoRoot: string, ref: string | null): Set<string> | null {
+  if (!ref) return null;
+  const out = git(['cat-file', 'blob', ref], { cwd: repoRoot });
+  if (!out.ok) return null;
+  return new Set(out.stdout.split('\0').filter((p) => p.length > 0));
 }
 
 // --- the checkpoint ----------------------------------------------------------
@@ -258,6 +384,7 @@ export function checkpointTask(config: Config, task: { id: string; cwd: string }
 
   const head = headCommit(repoRoot);
   const detached = head ? headIsDetached(repoRoot) : false;
+  const inProgress = operationInProgress(repoRoot);
   const indexFile = scratchIndex(config, task.id);
 
   try {
@@ -285,10 +412,32 @@ export function checkpointTask(config: Config, task: { id: string; cwd: string }
       return { ok: false, reason };
     }
 
+    // Recorded before the task, because after it the answer may have changed. Undo refuses rather
+    // than guesses when this is missing, so a failure here is a refusal, not a shrug.
+    const ignoredRef = captureIgnored(repoRoot, task.id);
+    if (!ignoredRef) {
+      const reason = 'could not record which files .gitignore covers, so undo could not tell them apart later';
+      logEvent(config, { kind: 'checkpoint_refused', taskId: task.id, cwd, reason });
+      return { ok: false, reason };
+    }
+
     const listed = git(['ls-tree', '-r', '-z', '--name-only', written.tree], { cwd: repoRoot });
     const files = listed.ok ? listed.stdout.split('\0').filter((p) => p.length > 0).length : 0;
 
-    const record: CheckpointRecord = { taskId: task.id, ref, commit: commitHash, tree: written.tree, repoRoot, cwd, head, detached, files };
+    const record: CheckpointRecord = {
+      taskId: task.id,
+      ref,
+      commit: commitHash,
+      tree: written.tree,
+      repoRoot,
+      cwd,
+      head,
+      detached,
+      files,
+      ignoredRef,
+      inProgress,
+      postImage: null,
+    };
     logEvent(config, {
       kind: 'checkpoint',
       taskId: task.id,
@@ -300,8 +449,51 @@ export function checkpointTask(config: Config, task: { id: string; cwd: string }
       head,
       detached,
       files,
+      ignoredRef,
+      inProgress,
     });
     return { ok: true, record };
+  } finally {
+    discardIndex(indexFile);
+  }
+}
+
+/**
+ * Captures the working tree again when the task ends. This is what makes provenance a fact.
+ *
+ * Same plumbing as the checkpoint, parented on the checkpoint commit so the pair hangs together.
+ * A failure here is logged and swallowed: the task has already finished, and the honest consequence
+ * is that undo degrades to "provenance unknown" and refuses the blanket undo, which is handled at
+ * the undo end rather than by throwing at the end of somebody's task.
+ */
+export function postImageTask(config: Config, record: CheckpointRecord): PostImage | null {
+  const indexFile = scratchIndex(config, `post-${record.taskId}`);
+  try {
+    if (!existsSync(record.repoRoot)) return null;
+    const head = headCommit(record.repoRoot);
+    const written = writeWorktreeTree(record.repoRoot, indexFile, head);
+    if (!written.ok) {
+      logEvent(config, { kind: 'postimage_failed', taskId: record.taskId, reason: written.reason });
+      return null;
+    }
+    const commit = git(['commit-tree', written.tree, '-p', record.commit, '-m', `conductor post-image after task ${record.taskId}`], {
+      cwd: record.repoRoot,
+      indexFile,
+      identity: true,
+    });
+    const commitHash = commit.stdout.trim();
+    if (!commit.ok || !commitHash) {
+      logEvent(config, { kind: 'postimage_failed', taskId: record.taskId, reason: `git commit-tree failed: ${commit.stderr.trim()}` });
+      return null;
+    }
+    const ref = refFor(record.taskId, POSTIMAGE_REF_PREFIX);
+    const update = git(['update-ref', ref, commitHash], { cwd: record.repoRoot, indexFile });
+    if (!update.ok) {
+      logEvent(config, { kind: 'postimage_failed', taskId: record.taskId, reason: `git update-ref failed: ${update.stderr.trim()}` });
+      return null;
+    }
+    logEvent(config, { kind: 'postimage', taskId: record.taskId, ref, commit: commitHash, tree: written.tree, repoRoot: record.repoRoot });
+    return { ref, commit: commitHash, tree: written.tree };
   } finally {
     discardIndex(indexFile);
   }
@@ -310,11 +502,17 @@ export function checkpointTask(config: Config, task: { id: string; cwd: string }
 // --- finding a checkpoint again ----------------------------------------------
 
 /**
- * The last checkpoint, or the one for a named task, read back out of the logbook.
+ * The last checkpoint, or the one for a named task, read back out of the logbook, together with the
+ * post-image that was taken after it.
  *
- * The logbook is the record on purpose: the spec's simplicity budget says state is four plain
- * things, and a fifth file holding checkpoint metadata would be a fifth thing earning nothing the
+ * The logbook is the record on purpose: the spec's simplicity budget says state is a few plain
+ * things, and a file holding checkpoint metadata would be one more thing earning nothing the
  * append-only log already provides.
+ *
+ * The scan runs backwards, which is also what makes the pairing safe: a post-image event is always
+ * written after its own checkpoint event, so the first post-image seen while walking backwards
+ * belongs to the checkpoint reached later in the same walk. A reused task id from an earlier daemon
+ * lifetime cannot lend its post-image to a newer checkpoint.
  */
 export function findCheckpoint(config: Config, taskId?: string): CheckpointRecord | null {
   let text: string;
@@ -324,6 +522,7 @@ export function findCheckpoint(config: Config, taskId?: string): CheckpointRecor
     return null;
   }
   const lines = text.split('\n');
+  const posts = new Map<string, PostImage>();
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]?.trim();
     if (!line) continue;
@@ -333,10 +532,15 @@ export function findCheckpoint(config: Config, taskId?: string): CheckpointRecor
     } catch {
       continue;
     }
+    const id = typeof event['taskId'] === 'string' ? event['taskId'] : '';
+    if (event['kind'] === 'postimage' && id && !posts.has(id)) {
+      posts.set(id, { ref: String(event['ref']), commit: String(event['commit']), tree: String(event['tree'] ?? '') });
+      continue;
+    }
     if (event['kind'] !== 'checkpoint') continue;
-    if (taskId && event['taskId'] !== taskId) continue;
+    if (taskId && id !== taskId) continue;
     return {
-      taskId: String(event['taskId']),
+      taskId: id,
       ref: String(event['ref']),
       commit: String(event['commit']),
       tree: String(event['tree'] ?? ''),
@@ -345,6 +549,9 @@ export function findCheckpoint(config: Config, taskId?: string): CheckpointRecor
       head: typeof event['head'] === 'string' ? event['head'] : null,
       detached: event['detached'] === true,
       files: typeof event['files'] === 'number' ? event['files'] : 0,
+      ignoredRef: typeof event['ignoredRef'] === 'string' ? event['ignoredRef'] : null,
+      inProgress: event['inProgress'] === 'merge' || event['inProgress'] === 'rebase' ? event['inProgress'] : null,
+      postImage: posts.get(id) ?? null,
     };
   }
   return null;
@@ -368,15 +575,43 @@ function insideTaskFolder(spec: string | null, repoRelPath: string): boolean {
   return spec === null || repoRelPath === spec || repoRelPath.startsWith(`${spec}/`);
 }
 
+/** path -> single-letter status, left tree against right tree. Null when git could not answer. */
+function diffPaths(repoRoot: string, fromTree: string, toTree: string): Map<string, string> | null {
+  // --no-renames keeps the output to one path per line, which is the only shape undo can act on.
+  const diff = git(['diff-tree', '-r', '-z', '--no-renames', '--name-status', fromTree, toTree], { cwd: repoRoot });
+  if (!diff.ok) return null;
+  const fields = diff.stdout.split('\0').filter((f) => f.length > 0);
+  const out = new Map<string, string>();
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const status = (fields[i] ?? '').charAt(0);
+    const path = fields[i + 1] ?? '';
+    if (path) out.set(path, status);
+  }
+  return out;
+}
+
+export interface PreviewOptions {
+  /**
+   * Touch the held set too. Deliberately not the same word as "confirm": confirming means "yes, do
+   * the list you showed me", while this means "yes, also overwrite work the task did not do".
+   */
+  overrideChangedAfterTask?: boolean;
+}
+
 /**
  * What undo would do, computed without changing anything.
  *
- * Undo is itself destructive, so this exists to be shown to a human first. It compares the
- * checkpoint's tree with a tree built the same way from the current working tree, which is the only
- * comparison that sees files the task created: a plain `git diff <commit>` never would, because
- * untracked paths are not in any index it reads.
+ * Undo is itself destructive, so this exists to be shown to a human first. Three trees are compared,
+ * not two. checkpoint..current is the candidate set, which is the only comparison that sees files
+ * the task created, because a plain `git diff <commit>` never would: untracked paths are in no index
+ * it reads. checkpoint..post-image is what the task actually did. post-image..current is what
+ * somebody else did afterwards. Undo acts on the first minus the third, and says so.
  */
-export function previewUndo(config: Config, record: CheckpointRecord): { ok: true; plan: UndoPlan } | { ok: false; reason: string } {
+export function previewUndo(
+  config: Config,
+  record: CheckpointRecord,
+  options: PreviewOptions = {},
+): { ok: true; plan: UndoPlan } | { ok: false; reason: string } {
   if (!existsSync(record.repoRoot)) return { ok: false, reason: `the repository "${record.repoRoot}" is gone` };
   const resolved = git(['rev-parse', '--verify', '--quiet', `${record.ref}^{commit}`], { cwd: record.repoRoot });
   if (!resolved.ok || !resolved.stdout.trim()) {
@@ -391,39 +626,171 @@ export function previewUndo(config: Config, record: CheckpointRecord): { ok: tru
     };
   }
 
+  // Refusal, not a fallback. Re-reading today's .gitignore would answer a question about the past
+  // with a file the task may have edited, which is exactly the hole this closes.
+  const ignored = readIgnored(record.repoRoot, record.ignoredRef);
+  if (!ignored) {
+    return {
+      ok: false,
+      reason:
+        `the ignore set recorded with checkpoint "${record.ref}" is missing, so undo cannot tell which files .gitignore ` +
+        `covered when the checkpoint was taken. It will not guess from the current .gitignore, because a task can edit it.`,
+    };
+  }
+
   const indexFile = scratchIndex(config, `undo-${record.taskId}`);
   try {
     const head = headCommit(record.repoRoot);
     const current = writeWorktreeTree(record.repoRoot, indexFile, head);
     if (!current.ok) return { ok: false, reason: current.reason };
 
-    // --no-renames keeps the output to one path per line, which is the only shape undo can act on.
-    const diff = git(['diff-tree', '-r', '-z', '--no-renames', '--name-status', `${record.commit}^{tree}`, current.tree], {
-      cwd: record.repoRoot,
-    });
-    if (!diff.ok) return { ok: false, reason: `git diff-tree failed: ${diff.stderr.trim()}` };
+    const checkpointTree = `${record.commit}^{tree}`;
+    const candidates = diffPaths(record.repoRoot, checkpointTree, current.tree);
+    if (!candidates) return { ok: false, reason: 'git diff-tree failed comparing the checkpoint with the working tree' };
 
-    const fields = diff.stdout.split('\0').filter((f) => f.length > 0);
+    // Provenance. Verified against the repository, not merely believed from the logbook: a ref that
+    // has been deleted degrades to "unknown" the same way a task that never finished does.
+    let taskChanged: Map<string, string> | null = null;
+    let changedAfter: Map<string, string> | null = null;
+    const post = record.postImage;
+    if (post?.tree) {
+      const postOk = git(['rev-parse', '--verify', '--quiet', `${post.commit}^{commit}`], { cwd: record.repoRoot });
+      if (postOk.ok && postOk.stdout.trim()) {
+        taskChanged = diffPaths(record.repoRoot, checkpointTree, `${post.commit}^{tree}`);
+        changedAfter = diffPaths(record.repoRoot, `${post.commit}^{tree}`, current.tree);
+      }
+    }
+    const provenance: UndoPlan['provenance'] = taskChanged && changedAfter ? 'post-image' : 'unknown';
+    const override = options.overrideChangedAfterTask === true;
+
     const changes: UndoChange[] = [];
+    const held: HeldChange[] = [];
+    const ignoredSkipped: string[] = [];
     let outsideCount = 0;
-    for (let i = 0; i + 1 < fields.length; i += 2) {
-      const status = (fields[i] ?? '').charAt(0);
-      const path = fields[i + 1] ?? '';
-      if (!path) continue;
+
+    for (const [path, status] of candidates) {
       if (!insideTaskFolder(spec, path)) {
         outsideCount++;
         continue;
       }
-      // Direction: left side is the checkpoint, right side is now. A means the task added it.
-      if (status === 'A') changes.push({ path, action: 'delete', why: 'created' });
-      else if (status === 'D') changes.push({ path, action: 'restore', why: 'missing' });
-      else changes.push({ path, action: 'restore', why: 'modified' });
+      // Ignored at checkpoint time means outside the before-image in both directions. The stated
+      // limit says undo neither restores nor deletes these, and this is the line that makes it true
+      // even when the task rewrote .gitignore.
+      if (ignored.has(path)) {
+        ignoredSkipped.push(path);
+        continue;
+      }
+      // Direction: left side is the checkpoint, right side is now. A means it appeared since.
+      const change: UndoChange =
+        status === 'A' ? { path, action: 'delete', why: 'created' } : status === 'D' ? { path, action: 'restore', why: 'missing' } : { path, action: 'restore', why: 'modified' };
+
+      if (provenance === 'unknown') {
+        held.push({ ...change, held: 'unknown-provenance' });
+        continue;
+      }
+      // Two ways to be somebody else's work: the task never touched it, or the task touched it and
+      // then somebody touched it again. Both are held.
+      if (!taskChanged?.has(path) || changedAfter?.has(path)) {
+        held.push({ ...change, held: 'changed-after-task' });
+        continue;
+      }
+      changes.push(change);
     }
+
+    if (override) for (const h of held) changes.push({ path: h.path, action: h.action, why: h.why });
+
     changes.sort((a, b) => a.path.localeCompare(b.path));
-    return { ok: true, plan: { record, changes, outsideCount } };
+    held.sort((a, b) => a.path.localeCompare(b.path));
+    ignoredSkipped.sort((a, b) => a.localeCompare(b));
+
+    return {
+      ok: true,
+      plan: {
+        record,
+        changes,
+        outsideCount,
+        provenance,
+        held,
+        override,
+        caseCollisions: caseCollisionsIn(changes),
+        ignoredSkipped,
+        notes: limitNotes(record, checkpointTree),
+      },
+    };
   } finally {
     discardIndex(indexFile);
   }
+}
+
+/**
+ * The limits this repository actually hits, in plain sentences, for the preview.
+ *
+ * Every one of these is a limit Sol named and none of them is being fixed here. What changes is that
+ * the preview stops being silent about them: a human deciding whether to trust an undo can see that
+ * this folder contains a submodule, or a symlink, or a .gitattributes that can hide a difference.
+ */
+function limitNotes(record: CheckpointRecord, checkpointTree: string): string[] {
+  const facts = treeFacts(record.repoRoot, checkpointTree);
+  const notes: string[] = [];
+  if (facts.submodules > 0) {
+    notes.push(
+      `${facts.submodules} submodule(s) are in this folder. The checkpoint holds the commit each one pointed at, not the ` +
+        `files inside it, so uncommitted work inside a submodule is neither captured nor restored.`,
+    );
+  }
+  if (facts.symlinks > 0) {
+    notes.push(`${facts.symlinks} symlink(s) are in this folder. The link itself is restored; whatever it points at is not.`);
+  }
+  if (facts.gitattributes) {
+    notes.push(
+      'this repository has a .gitattributes. Attributes such as "text", "working-tree-encoding", "ident" and clean or ' +
+        'smudge filters rewrite bytes on the way in, so a file can come back converted, and a difference that is only ' +
+        'line endings may not appear in the list above at all.',
+    );
+  }
+  if (record.inProgress) {
+    notes.push(`a ${record.inProgress} was in progress when the checkpoint was taken. Undo does not restore it, or the index it belongs to.`);
+  }
+  return notes;
+}
+
+/**
+ * Deletions that name the same file as a restore under a different spelling.
+ *
+ * Sol's finding 5: a task renames `foo.txt` to `FOO.txt`, so the plan restores `foo.txt` and deletes
+ * `FOO.txt`. On Windows those are one file, and restoring first meant the delete then removed the
+ * file that had just been put back. Ordering the two is the fix; naming the collision is what keeps
+ * the fix from quietly regressing, and it puts the case in the preview where a human can see it.
+ */
+function caseCollisionsIn(changes: UndoChange[]): string[] {
+  const restores = new Set(changes.filter((c) => c.action === 'restore').map((c) => c.path.toLowerCase()));
+  return changes
+    .filter((c) => c.action === 'delete' && restores.has(c.path.toLowerCase()))
+    .map((c) => c.path)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * A fingerprint of the exact plan, so confirmation can be bound to the preview a human read.
+ *
+ * Sol's finding 3: the confirming call recomputed its own plan and applied that, so what executed
+ * was never the list anybody approved. The daemon now stores the plan under this fingerprint and
+ * applies the stored one. Consent is to a specific list of paths; this is what makes "specific"
+ * checkable.
+ */
+export function planFingerprint(plan: UndoPlan): string {
+  const canonical = JSON.stringify({
+    taskId: plan.record.taskId,
+    ref: plan.record.ref,
+    commit: plan.record.commit,
+    repoRoot: plan.record.repoRoot,
+    cwd: plan.record.cwd,
+    provenance: plan.provenance,
+    override: plan.override,
+    changes: plan.changes.map((c) => [c.path, c.action, c.why]),
+    held: plan.held.map((h) => [h.path, h.held]),
+  });
+  return createHash('sha256').update(canonical).digest('hex');
 }
 
 export interface UndoOutcome {
@@ -434,8 +801,11 @@ export interface UndoOutcome {
 
 /**
  * Puts the working tree back. Only paths the plan names, which are only paths inside the task
- * folder, which are only paths that were in the checkpoint or are in the current tree. Ignored files
- * are in neither, so undo cannot reach them.
+ * folder, which are only paths that were in the checkpoint or are in the current tree and were not
+ * ignored when the checkpoint was taken.
+ *
+ * Deletions run first. That is not a preference: on a case-insensitive filesystem `foo.txt` and
+ * `FOO.txt` are one object, so a restore followed by a delete destroys the file it just restored.
  */
 export function applyUndo(config: Config, plan: UndoPlan): UndoOutcome {
   const { record } = plan;
@@ -444,6 +814,18 @@ export function applyUndo(config: Config, plan: UndoPlan): UndoOutcome {
   const failures: string[] = [];
   let restored = 0;
   let deleted = 0;
+
+  const emptiedDirs: string[] = [];
+  for (const path of remove) {
+    const full = join(record.repoRoot, path);
+    try {
+      rmSync(full, { force: true });
+      deleted++;
+      emptiedDirs.push(dirname(full));
+    } catch (err) {
+      failures.push(`could not delete "${full}": ${String(err)}`);
+    }
+  }
 
   if (restore.length > 0) {
     const indexFile = scratchIndex(config, `restore-${record.taskId}`);
@@ -457,29 +839,17 @@ export function applyUndo(config: Config, plan: UndoPlan): UndoOutcome {
         // checkout-index will not create leading directories for us, so the ones a deletion removed
         // are made first.
         for (const path of restore) mkdirSync(dirname(join(record.repoRoot, path)), { recursive: true });
-        const out = git([...NO_EOL_CONVERSION, 'checkout-index', '-f', '-z', '--stdin'], {
-          cwd: record.repoRoot,
-          indexFile,
-          input: restore.join('\0'),
-        });
-        if (out.ok) restored = restore.length;
-        else failures.push(`git checkout-index failed: ${out.stderr.trim()}`);
+        const outcome = checkoutPaths(record.repoRoot, indexFile, restore);
+        restored = outcome.restored;
+        failures.push(...outcome.failures);
       }
     } finally {
       discardIndex(indexFile);
     }
   }
 
-  for (const path of remove) {
-    const full = join(record.repoRoot, path);
-    try {
-      rmSync(full, { force: true });
-      deleted++;
-      pruneEmptyDirs(dirname(full), record.cwd);
-    } catch (err) {
-      failures.push(`could not delete "${full}": ${String(err)}`);
-    }
-  }
+  // Last, so a directory a restore needed is never pruned between the delete and the restore.
+  for (const dir of emptiedDirs) pruneEmptyDirs(dir, record.cwd);
 
   logEvent(config, {
     kind: 'undo',
@@ -488,13 +858,40 @@ export function applyUndo(config: Config, plan: UndoPlan): UndoOutcome {
     commit: record.commit,
     repoRoot: record.repoRoot,
     cwd: record.cwd,
+    provenance: plan.provenance,
+    override: plan.override,
     restored,
     deleted,
+    heldBack: plan.held.length,
     outsideLeftAlone: plan.outsideCount,
     failures: failures.length,
   });
 
   return { restored, deleted, failures };
+}
+
+/**
+ * checkout-index over a path list, with an honest count when it fails part way.
+ *
+ * Sol's finding 15: one batch call that fails after writing some files was reported as `restored: 0`
+ * next to `applied: true`, so the numbers described a run that never happened. The batch is still
+ * the fast path; a failure falls back to one call per path, which costs a process per file only in
+ * the case that was already going wrong, and yields a count and a failure list that match what
+ * happened on disk.
+ */
+function checkoutPaths(repoRoot: string, indexFile: string, paths: string[]): { restored: number; failures: string[] } {
+  const args = [...NO_EOL_CONVERSION, 'checkout-index', '-f', '-z', '--stdin'];
+  const batch = git(args, { cwd: repoRoot, indexFile, input: paths.join('\0') });
+  if (batch.ok) return { restored: paths.length, failures: [] };
+
+  const failures: string[] = [`git checkout-index failed for the batch: ${batch.stderr.trim()}`];
+  let restored = 0;
+  for (const path of paths) {
+    const one = git(args, { cwd: repoRoot, indexFile, input: path });
+    if (one.ok) restored++;
+    else failures.push(`could not restore "${path}": ${one.stderr.trim()}`);
+  }
+  return { restored, failures };
 }
 
 /** Removes directories a deletion emptied, never climbing above the task folder. */
@@ -521,22 +918,64 @@ export function describePlan(plan: UndoPlan): string {
     `  commit: ${record.commit}`,
     '',
   ];
+
+  if (plan.provenance === 'unknown') {
+    lines.push('  NO POST-IMAGE was recorded for this task, so Conductor cannot tell the task\'s work from anybody');
+    lines.push('  else\'s. The task did not finish cleanly, or its post-image is gone. Provenance is unknown, so the');
+    lines.push('  blanket undo is refused. Nothing below will be touched without the override named at the end.');
+    lines.push('');
+  }
+
   if (changes.length === 0) {
-    lines.push('  nothing to change: the folder already matches the checkpoint.');
+    lines.push(plan.held.length > 0 ? '  nothing would be changed: every difference is being held back, see below.' : '  nothing to change: the folder already matches the checkpoint.');
   } else {
     for (const change of changes) {
       const verb = change.action === 'delete' ? 'delete   (created by the task)' : change.why === 'missing' ? 'restore  (deleted by the task)' : 'restore  (changed by the task)';
       lines.push(`  ${verb}  ${change.path}`);
     }
   }
+
   const restoreCount = changes.filter((c) => c.action === 'restore').length;
   const deleteCount = changes.length - restoreCount;
   lines.push('');
   lines.push(`  ${restoreCount} file(s) restored, ${deleteCount} file(s) deleted.`);
+
+  if (plan.held.length > 0) {
+    lines.push('');
+    if (plan.override) {
+      lines.push(`  OVERRIDE GIVEN: the ${plan.held.length} path(s) below are NOT the task's work and will be changed anyway:`);
+    } else if (plan.provenance === 'unknown') {
+      lines.push(`  held back, provenance unknown (${plan.held.length}):`);
+    } else {
+      lines.push(`  changed after the task finished, so left alone (${plan.held.length}):`);
+    }
+    for (const h of plan.held) lines.push(`    ${h.action === 'delete' ? 'would delete ' : 'would restore'}  ${h.path}`);
+    if (!plan.override) {
+      lines.push('  These are somebody else\'s changes, not the task\'s. Undo will not touch them. To include exactly');
+      lines.push('  the paths listed above, send "overrideChangedAfterTask": true, or pass');
+      lines.push('  --override-changed-after-task on the command line.');
+    }
+  }
+
+  if (plan.caseCollisions.length > 0) {
+    lines.push('');
+    lines.push(`  ${plan.caseCollisions.length} path(s) differ from a restored path only in case, so on Windows they are the same file.`);
+    lines.push('  Undo deletes before it restores, so the checkpoint spelling is what ends up on disk:');
+    for (const path of plan.caseCollisions) lines.push(`    ${path}`);
+  }
+
   if (plan.outsideCount > 0) {
     lines.push(`  ${plan.outsideCount} changed file(s) outside the task folder are left exactly as they are.`);
   }
-  lines.push('  files ignored by .gitignore were never checkpointed, so undo neither restores nor deletes them.');
-  lines.push('  your branch, HEAD and staged changes are not touched.');
+  if (plan.ignoredSkipped.length > 0) {
+    lines.push(`  ${plan.ignoredSkipped.length} path(s) .gitignore covered when the checkpoint was taken are left alone.`);
+  }
+  lines.push('  files ignored by .gitignore when the checkpoint was taken were never in the before-image, so undo');
+  lines.push('  neither restores nor deletes them, whatever .gitignore says now.');
+  lines.push('  directories a deletion leaves empty are removed, up to the task folder.');
+  lines.push('  your index, HEAD, branch and any merge or rebase in progress are not read and not restored. This is');
+  lines.push('  a working-tree image only: staged state the task destroyed does not come back.');
+  for (const note of plan.notes) lines.push(`  ${note}`);
+  lines.push('  this list is not a guarantee of completeness. The known limits are in docs/notes/m2-sliceA-findings.md.');
   return lines.join('\n');
 }

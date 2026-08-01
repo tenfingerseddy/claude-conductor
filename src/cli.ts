@@ -22,6 +22,9 @@ const USAGE = `conductor <command>
   run                          start working the pending list
   undo [taskId] [--yes]        put the task's folder back to its before-image
                                without --yes it only shows what it would change
+       [--override-changed-after-task]
+                               also touch files changed after the task finished, which undo
+                               otherwise leaves alone and lists by name
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
@@ -171,13 +174,18 @@ async function startRun(): Promise<number> {
  * Undo the last task, or a named one. Two round trips on purpose: the first asks for the preview and
  * changes nothing, and only `--yes` sends the second. Undo is destructive, so a human sees the file
  * list before anything moves, and forgetting the flag costs a reprint rather than a tree.
+ *
+ * The second call carries the first call's planId and planHash, so the daemon applies the list that
+ * was printed above rather than one it works out again on arrival. If the tree moved in between, the
+ * hash stops it and the human is told to look again.
  */
 async function undo(args: string[]): Promise<number> {
   const { positional, flags } = parseFlags(args);
   const taskId = positional[0]?.trim();
   const confirm = flags['yes'] === 'true' || flags['y'] === 'true';
+  const override = flags['override-changed-after-task'] === 'true';
 
-  const preview = asRecord(await post('/undo', { ...(taskId ? { taskId } : {}), confirm: false }));
+  const preview = asRecord(await post('/undo', { ...(taskId ? { taskId } : {}), ...(override ? { overrideChangedAfterTask: true } : {}) }));
   if (preview['error']) {
     out(`conductor: ${String(preview['error'])}`);
     return 1;
@@ -188,11 +196,11 @@ async function undo(args: string[]): Promise<number> {
   if (changes.length === 0) return 0;
   if (!confirm) {
     out('');
-    out(`nothing has been changed. Run "conductor undo ${String(preview['taskId'])} --yes" to apply it.`);
+    out(`nothing has been changed. Run "conductor undo ${String(preview['taskId'])} --yes${override ? ' --override-changed-after-task' : ''}" to apply exactly the list above.`);
     return 0;
   }
 
-  const applied = asRecord(await post('/undo', { taskId: preview['taskId'], confirm: true }));
+  const applied = asRecord(await post('/undo', { confirm: true, planId: preview['planId'], planHash: preview['planHash'] }));
   if (applied['error']) {
     out(`conductor: ${String(applied['error'])}`);
     return 1;
