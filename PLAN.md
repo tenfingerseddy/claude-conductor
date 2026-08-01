@@ -318,8 +318,24 @@ src/
       **failed again**, four real findings, three reaching execution unasked. Raw output:
       `docs/notes/sol-review-m1-final.md`. Root cause named: the classifier judges a string the
       shell has not finished transforming.
-- [ ] Rail simplification: empty the vouched set, refuse autonomous trust at the gate, keep
+- [x] Rail simplification: empty the vouched set, refuse autonomous trust at the gate, keep
       structured tools flowing. Closes the finding class by construction rather than by patching.
+      Landed: 285 lines deleted from the classifier, 0 of 24 probe strings vouched, all nine of
+      Sol's bypasses tap, autonomous refused at both gates with no session started. Evidence in
+      `docs/notes/m1-railsimplify-findings.md`.
+- [ ] Sol gate follow-up. The gate **failed**, narrowly, and the deletion itself held: no
+      shell-shaped call got through and no default-allow branch exists. The hole is the SDK
+      configuration around the rail, not the rail. Three findings in
+      `docs/notes/sol-review-m1-gate.md`: (1) merge-blocking, the session is built without
+      `settingSources: []` and `strictMcpConfig: true`, so it loads whatever settings and MCP
+      config the task folder or user profile carries, and a settings-file hook is a process launch
+      rather than a tool call, so neither rail layer ever sees it; (2) the shell-tool name match
+      misses `run_script`, `python`, `spawn`, `script`, not an escape today but the findings note
+      overclaimed that it could not be; (3) `runSession` is exported without the trust refusal, so
+      in-process code could start an autonomous session, engine boundary only.
+      Neat consequence: finding 1's fix is also the fix for the earlier wrinkle where a parent
+      `CLAUDE.md` and Kane's email address flowed into every fresh session. One change, three
+      problems.
 - [ ] Merge to main, with autonomous trust disabled and the permissive default deferred to M2.
 - Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
   and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
