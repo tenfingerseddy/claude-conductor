@@ -538,7 +538,34 @@ Nothing else in M2 is safe without this, so it goes first.
 - Symlink detection exists but is **unverified**: this account cannot create a symlink on this
   host (`EPERM`), so the code path has never run. The findings say so rather than implying
   coverage. It needs verifying on a machine or account that can, before anything relies on it.
-- Still unmerged and correctly so. Next: fix finding 4, then one Sol pass over the whole slice.
+- **Second fix round landed** (commit `9a392ac`, `docs/notes/m2-sliceA-fix2-findings.md`), closing
+  the last two defects. Sol's carried finding 4 is fixed: the entire inherited `GIT_*` namespace is
+  stripped, case-insensitively, and only `GIT_INDEX_FILE`, `GIT_TERMINAL_PROMPT` and the commit
+  identity go back in, with nothing allowlisted. `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are
+  stripped but deliberately not blanked, so Conductor still reads the repository the way the user's
+  own git does; the settings that must not vary are passed per command as `-c`, which outranks any
+  config file. Before the fix, a checkpoint of one repository wrote both Conductor refs into a
+  decoy repository and left the intended one with no checkpoint, and undo under `GIT_WORK_TREE`
+  reported success while changing nothing. 15 of 21 checks fail before, 0 after.
+- The architect's own read of `checkpoint.ts` found a second defect, now fixed: under unknown
+  provenance with the override given, the preview still printed "created by the task" for every
+  path, which is the one claim it cannot make without a post-image. That is the same class of flaw
+  Sol originally failed the slice for, so it mattered more than its size. One `verbFor` function now
+  owns the wording and attribution requires a post-image. The fix round found a third case unprompted:
+  with a post-image plus the override, somebody else's edits were being folded into the main list
+  under the task's name.
+- Architect's review of the code itself, done by reading it rather than trusting the reports: the
+  three-tree provenance logic is correct, deletes before restores is right, the pinned ignore blob
+  is the right shape, the plan fingerprint covers the fields that matter, and every git call is an
+  argument array with no shell. The file is comment-heavy to the point of reading like a design
+  document, which is defensible for the piece everything else rests on but is worth watching against
+  the simplicity budget.
+- Process note: `node_modules` disappeared mid-session and a `tsc` check silently did nothing while
+  reporting nothing, because `npx` fell through to a placeholder package. A commit was made before
+  that was noticed. Reinstalled, typecheck confirmed clean, CLI output confirmed by running it.
+  The lesson is the one already in the golden rules: `&&` chains that end in `;` do not gate
+  anything, and a verification that cannot fail is not a verification.
+- Still unmerged and correctly so. Sol round 2 in flight over the whole slice.
 - Notebook fact from this review: the codex read-only sandbox cannot launch a process on this
   host, so Sol's first run read nothing and correctly refused to review rather than invent
   findings. The workaround is to inline the files, line-numbered, in the brief. Worth knowing
