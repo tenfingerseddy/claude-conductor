@@ -1028,6 +1028,93 @@ say('--- the same three answers as Conductor behaviour ---');
   }
 }
 
+// --- 23b. the probe must match one exact ref, and must read stderr before stdout -------------
+
+say('\n=== 23b. for-each-ref is a pattern, and a warning can arrive next to a good hash ===');
+{
+  const R = join(ROOT, 'p7');
+  newRepo(R);
+  const probe = (ref: string, format: string): { code: number | null; out: string; err: string } =>
+    shSoft(R, ['--no-optional-locks', 'for-each-ref', ref, `--format=${format}`]);
+  const BARE = '%(objectname)';
+  const PAIRED = '%(refname)%00%(objectname)';
+  const show = (s: string): string => JSON.stringify(s.replace(/\0/g, '\\0'));
+
+  // The exact ref is absent; only a descendant of it exists. A refname is a path, so this is an
+  // ordinary thing for a repository to contain, not a corruption.
+  sh(R, ['branch', 'conductor/task-desc/sub']);
+  const bare = probe('refs/heads/conductor/task-desc', BARE);
+  const paired = probe('refs/heads/conductor/task-desc', PAIRED);
+  say(`  descendant, bare   exit=${bare.code} stdout=${show(bare.out)}`);
+  say(`  descendant, paired exit=${paired.code} stdout=${show(paired.out)}`);
+  check('the old bare format reports a hash for a ref that does not exist', bare.code === 0 && /^[0-9a-f]{40}$/.test(bare.out.trim()));
+  check('the paired format shows the name is the descendant, not the ref asked for', paired.out.includes('refs/heads/conductor/task-desc/sub\0'));
+  check('and no record names the ref itself', !paired.out.split('\n').some((l) => l.split('\0')[0] === 'refs/heads/conductor/task-desc'));
+
+  // A good hash for the exact ref AND a warning in the same walk. Packed refs make this reachable:
+  // packing conductor/task-both removes its loose file, which frees the directory name, so a broken
+  // loose ref can then sit underneath it. Both are iterated by the same pattern.
+  sh(R, ['branch', 'conductor/task-both']);
+  sh(R, ['pack-refs', '--all']);
+  mkdirSync(join(R, '.git', 'refs', 'heads', 'conductor', 'task-both'), { recursive: true });
+  writeFileSync(join(R, '.git', 'refs', 'heads', 'conductor', 'task-both', 'sub'), 'this is not a hash\n');
+  const both = probe('refs/heads/conductor/task-both', PAIRED);
+  say(`  hash+warning exit=${both.code} stdout=${show(both.out)} stderr=${JSON.stringify(both.err.trim())}`);
+  check('git prints a usable hash and a warning at the same time', both.code === 0 && both.out.includes('refs/heads/conductor/task-both\0') && both.err.trim() !== '');
+
+  // Present and absent again under the paired format, so the whole mapping is shown on one repo.
+  sh(R, ['branch', 'conductor/task-plain']);
+  const plain = probe('refs/heads/conductor/task-plain', PAIRED);
+  say(`  present      exit=${plain.code} stdout=${show(plain.out)} stderr=${JSON.stringify(plain.err.trim())}`);
+  check('present: one record naming the ref exactly', plain.code === 0 && plain.err.trim() === '' && plain.out.trim().split('\0')[0] === 'refs/heads/conductor/task-plain');
+  const none = probe('refs/heads/conductor/task-nothing', PAIRED);
+  say(`  absent       exit=${none.code} stdout=${show(none.out)} stderr=${JSON.stringify(none.err.trim())}`);
+  check('absent: exit 0, no records, nothing on stderr', none.code === 0 && none.out.trim() === '' && none.err.trim() === '');
+}
+
+say('--- the descendant case as Conductor behaviour ---');
+{
+  // A recorded workspace whose branch is gone, with a descendant branch left in its place. The tip
+  // read must call that absent. Calling it present hands a stranger's hash to a compare-and-delete
+  // and tells the user a branch of theirs is leftover Conductor litter.
+  const R = join(ROOT, 'p8');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'p8', cwd: R });
+  check('p8 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    sh(R, ['branch', '-D', w.branch]);
+    sh(R, ['branch', `${w.branch}/sub`]);
+    const descendantTip = sh(R, ['rev-parse', `${w.branch}/sub`]).trim();
+    say(`  ${w.branch} is gone; ${w.branch}/sub is at ${descendantTip.slice(0, 12)}`);
+
+    const d = seamed.discardWorkspace(config, w);
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (note: ${d.note})` : ', no note'}` : d.reason}`);
+    check('a descendant branch does not make the task branch look present', d.ok === true && !('note' in d && d.note));
+    check("the descendant branch was not touched", sh(R, ['rev-parse', `${w.branch}/sub`]).trim() === descendantTip);
+  }
+}
+
+say('--- a warning beside a good hash as Conductor behaviour ---');
+{
+  const R = join(ROOT, 'p9');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'p9', cwd: R });
+  check('p9 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    sh(R, ['pack-refs', '--all']);
+    mkdirSync(join(R, '.git', 'refs', 'heads', 'conductor', 'task-p9'), { recursive: true });
+    writeFileSync(join(R, '.git', 'refs', 'heads', 'conductor', 'task-p9', 'sub'), 'this is not a hash\n');
+    const d = seamed.discardWorkspace(config, w);
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (note: ${d.note})` : ', no note'}` : d.reason.slice(0, 160)}`);
+    check('a warning in the walk is not overridden by the hash beside it', d.ok === false);
+    check('the refusal quotes what git warned about', d.ok === false && d.reason.includes('broken ref'));
+  }
+}
+
 say('--- the case the old probe got wrong: a failure with nothing on either stream ---');
 {
   // This is Sol's actual point. `rev-parse --verify --quiet` exits non-zero for a missing ref AND for

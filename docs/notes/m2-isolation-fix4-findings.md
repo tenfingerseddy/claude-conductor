@@ -87,6 +87,54 @@ The same-tip ABA race on branch deletion, stated accurately in the code comment.
 lenient resolution, `realPath(worktreePath)` after a successful `git worktree add`, where no
 containment decision depends on the result and the folder provably exists.
 
+## Round 5, on top of `ce14ecd`: the probe again, and this time exactly
+
+Sol closed item 2 under the threat model and failed item 1 twice over. Both defects were in
+`branchTip` alone, and the fix is Sol's prescription adopted as written. Nothing else in the file
+changed and no caller changed.
+
+**Defect one: stdout was believed before stderr was checked.** The stated rule was that anything git
+says about the ref makes the answer unclean, but the code returned `present` as soon as it had a hash
+and only consulted stderr on an empty answer. A warning arriving beside a perfectly good hash was
+therefore ignored. This is reachable on a real repository: pack the task branch so its loose file goes
+away, which frees the directory name, then put a broken loose ref underneath it. The same pattern walk
+then yields both.
+
+    hash+warning exit=0 stdout="refs/heads/conductor/task-both\0 6d4f990..." stderr="warning: ignoring broken ref refs/heads/conductor/task-both/sub"
+
+**Defect two: `for-each-ref <ref>` is a pattern and matches descendants.** With
+`refs/heads/conductor/task-desc` absent and `refs/heads/conductor/task-desc/sub` present, the bare
+`%(objectname)` format printed the descendant's hash with nothing to say it was a different ref. A
+refname is a path, so this is an ordinary thing for a repository to contain, and the consequence is a
+stranger's hash handed to a compare-and-delete.
+
+    descendant, bare   exit=0 stdout="6d4f990b66677a2bb4fc61efed79f0a3bc119375\n"
+    descendant, paired exit=0 stdout="refs/heads/conductor/task-desc/sub\0 6d4f990b66677a2bb4fc61efed79f0a3bc119375\n"
+
+**The fix.** Format `%(refname)%00%(objectname)`. Any stderr is rejected before stdout is looked at.
+Present requires exactly one record whose refname equals the full ref exactly, and whose object name
+is 40 or 64 hex characters. No exact record is absent. Malformed or multiple exact records are
+unreadable.
+
+**Evidence.** The whole mapping is shown on one real repository in section 23b, raw, on git
+2.52.0.windows.1: present, absent, the descendant case under both formats, and the hash-plus-warning
+case. Then both defects as Conductor behaviour, end to end with no stub, run against a detached
+worktree of `ce14ecd` and against the fix.
+
+- Descendant. Against `ce14ecd`: `discard said: ok (note: ... A branch named "conductor/task-p8"
+  exists, but Conductor cannot confirm ...)`. No such branch exists; only `conductor/task-p8/sub`
+  does, and the user is being told their branch may be Conductor litter. Against the fix: `discard
+  said: ok, no note`, and the descendant is untouched.
+- Warning beside a hash. Against `ce14ecd`: the same false `ok` with a note claiming the branch
+  exists. Against the fix: a refusal quoting `warning: ignoring broken ref`.
+
+Against `ce14ecd` the run is `3 CHECK(S) FAILED`, all three in the new subsection, with the 180 checks
+before it passing unchanged. Against the fix: `ALL CHECKS PASSED`, 205 checks. `npx tsc --noEmit`
+clean with `node_modules` present.
+
+Nothing new is parked. The two limits named above, the same-tip ABA race and the one lenient
+`realPath(worktreePath)` after a successful add, are unchanged.
+
 ## Note on the harness
 
 Sections 21, 22, the silent-failure case in 23, and the seam half of 24 are not end-to-end

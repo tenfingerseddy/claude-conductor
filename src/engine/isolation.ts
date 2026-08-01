@@ -290,21 +290,47 @@ function headRef(repoRoot: string): string | null {
  *
  * Verified on git 2.52.0.windows.1, all three, plus the fourth case below.
  *
- * One refinement on top of that mapping. A ref whose file holds something that is not a hash makes
- * `for-each-ref` exit 0 with empty output and "warning: ignoring broken ref" on stderr, which would
- * otherwise read as a clean absence. Anything git had to say about the ref means it is not a clean
- * absence, so an empty answer with output on stderr is unreadable. That errs towards refusing, which
- * is the direction this whole file errs in.
+ * Two more things learned the hard way, both from Sol's pass on the version that only looked at the
+ * exit code and a bare `%(objectname)`.
+ *
+ * Anything git says about the ref means the answer is not clean, and that has to be checked before
+ * the output is, not after. A ref whose file holds something that is not a hash makes `for-each-ref`
+ * warn on stderr while still exiting 0, and it can do that while also printing a perfectly good hash
+ * for a different ref in the same walk. Reading stdout first turned that into a confident "present".
+ *
+ * `for-each-ref <ref>` is a pattern, not an exact lookup, and it matches descendants. With
+ * refs/heads/conductor/task-t1 absent and refs/heads/conductor/task-t1/sub present, a bare
+ * `%(objectname)` reported the descendant's hash as the task branch's tip, which is a wrong tip handed
+ * to a compare-and-delete. So the refname comes back too and has to match exactly: exactly one record
+ * whose name is the full ref is present, no such record is absent, and anything else, malformed or
+ * duplicated, is unreadable.
+ *
+ * Every branch of this errs towards refusing, which is the direction this whole file errs in.
  */
 type BranchTip = { state: 'present'; hash: string } | { state: 'absent' } | { state: 'unreadable'; detail: string };
 
 function branchTip(repoRoot: string, ref: string): BranchTip {
-  const result = gitRead(['for-each-ref', ref, '--format=%(objectname)'], { cwd: repoRoot });
+  const result = gitRead(['for-each-ref', ref, '--format=%(refname)%00%(objectname)'], { cwd: repoRoot });
   const detail = result.stderr.trim();
   if (!result.ok) return { state: 'unreadable', detail: detail || 'git could not read it' };
-  const hash = result.stdout.trim();
-  if (hash) return { state: 'present', hash };
-  return detail ? { state: 'unreadable', detail } : { state: 'absent' };
+  // Before stdout, not after. A warning means git stumbled somewhere in this walk, and a hash printed
+  // alongside it is not an answer this file is entitled to act on.
+  if (detail) return { state: 'unreadable', detail };
+
+  const exact = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line.slice(0, line.indexOf('\0')) === ref);
+  if (exact.length === 0) return { state: 'absent' };
+  if (exact.length > 1) return { state: 'unreadable', detail: `git listed ${exact.length} records for "${ref}"` };
+
+  const fields = exact[0]!.split('\0');
+  const hash = fields.length === 2 ? (fields[1] ?? '') : '';
+  // 40 hex for sha1, 64 for sha256. Anything else is not a commit id, whatever else it may be.
+  if (!/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(hash)) {
+    return { state: 'unreadable', detail: `git gave a record for "${ref}" that does not name a commit` };
+  }
+  return { state: 'present', hash };
 }
 
 // --- refusals ----------------------------------------------------------------
