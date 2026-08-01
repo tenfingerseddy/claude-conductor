@@ -108,7 +108,14 @@ Stop working, write down what happened, and tell Kane. Do not push through any o
 1. Any spike verdict comes back red. Especially spike 1.
 2. Anything appears to require `ANTHROPIC_API_KEY`, a token, or any credential in the repo.
 3. Usage data, logs, handoffs, or account identifiers are about to land in a committed file.
-4. Work drifts past the M1 finish line. M2 does not start in this run.
+4. Work drifts past the agreed scope of the current run. **Amended 2026-08-01, and the amendment
+   is itself worth noting.** This originally read "M2 does not start in this run", written when
+   the run was D1's M0-then-M1. Kane then said to work autonomously overnight, and assumption A2
+   recorded exactly what that permits: foundations that cannot loosen safety. Starting M2 slice A
+   was deliberate under that grant, not drift. But the stop condition was not updated to match at
+   the time, which meant the tracking file contradicted the work for several hours. Amending it
+   now rather than quietly ignoring it: scope changes get written down when they happen, or the
+   stop conditions stop meaning anything.
 5. A design choice contradicts the spec and the spec looks wrong. Say which is wrong, do not
    quietly pick one.
 6. Sol raises a finding that changes the design rather than the code.
@@ -466,6 +473,13 @@ Nothing else in M2 is safe without this, so it goes first.
   Two limits stated rather than skipped: `.gitignore`d files are not in the before-image and are
   never touched, and an in-tree `.gitattributes` `text` declaration still normalises content. Nothing
   about the rail, trust or permissions changed; autonomous trust is still refused.
+- **Gate on slice C.** Those two limits are not cosmetic, because "reversible" is the claim that
+  buys the permission. Before the permissive default is switched on, each must be either fixed or
+  accepted in writing by Kane: ignored files are outside the safety net, and a file whose bytes
+  disagree with its own `.gitattributes` comes back converted rather than identical. A safety net
+  with unstated holes is worse than a visible tap.
+- Pending: Sol review before this merges. Checkpoints are the foundation the permissive default
+  rests on, so they get the same adversarial treatment the rail got.
 
 ### Slice B, place enforcement and shell-free execution (the rail rebuild)
 
