@@ -323,7 +323,21 @@ src/
       Landed: 285 lines deleted from the classifier, 0 of 24 probe strings vouched, all nine of
       Sol's bypasses tap, autonomous refused at both gates with no session started. Evidence in
       `docs/notes/m1-railsimplify-findings.md`.
-- [ ] Sol gate follow-up. The gate **failed**, narrowly, and the deletion itself held: no
+- [x] Sol gate follow-up, all three closed with evidence (commit `161492c`,
+      `docs/notes/m1-gatefix-findings.md`). The merge blocker was demonstrated rather than argued:
+      a `.claude/settings.json` with SessionStart and UserPromptSubmit hooks plus a `.mcp.json`
+      stdio server were planted in a task folder, all three writing marker files. A control raw
+      SDK query on the same folder fired all three before the model spoke; the real Conductor loop
+      fired none, and the marker file does not exist. The tool matcher now catches every name Sol
+      named plus camelCase, and convicts on argument shape when the name is innocent; unreadable
+      arguments count as risky. `runSession` refuses autonomous trust itself with zero SDK
+      messages, so the HTTP and task-loop gates became defence in depth rather than the only
+      guards. The overclaim in the previous findings file is marked corrected.
+      Accepted tradeoff, recorded: `settingSources: []` means a target project's own CLAUDE.md no
+      longer loads, which SPEC's architecture section expects a session to have. Taken knowingly
+      for M1 because it also closes the leak where a parent CLAUDE.md and the account email flowed
+      into every fresh session. The permanent policy is an M2 open question, not decided here.
+- [x] Sol gate. **Failed**, narrowly, and the deletion itself held: no
       shell-shaped call got through and no default-allow branch exists. The hole is the SDK
       configuration around the rail, not the rail. Three findings in
       `docs/notes/sol-review-m1-gate.md`: (1) merge-blocking, the session is built without
