@@ -184,20 +184,54 @@ enforcement, no pacing, no VS Code panel, no phone page. Those are M2 and later.
 
 ### Scaffold
 
-- [ ] `package.json`, `tsconfig.json`, TypeScript, Node, terse modern style. Dependency list stays
+- [x] `package.json`, `tsconfig.json`, TypeScript, Node, terse modern style. Dependency list stays
       short and each unusual one is justified here.
-- [ ] `src/` layout agreed and written down in this file before code lands.
-- [ ] `.gitignore` that makes it impossible to commit state, logs, or credentials.
-- Evidence:
+- [x] `src/` layout agreed and written down in this file before code lands. See below.
+- [x] `.gitignore` that makes it impossible to commit state, logs, or credentials. (Landed with
+      M0: node_modules, `*.jsonl`, `handoffs/`, `.conductor/`, `.env`.)
+- Evidence: Slice 1 landed on `feat/m1-engine` with the state layer (below). Zero runtime deps.
+  Dev deps: `typescript`, plus `@types/node` because `tsc --noEmit` cannot resolve `node:fs`
+  without it; types only. Type stripping confirmed working on Node 24.11.1, `tsc --noEmit` clean.
+  `package-lock.json` gets committed in slice 2 for reproducibility. Full output in
+  `docs/notes/m1-slice1-findings.md`.
+
+Agreed `src/` layout (architect, 2026-08-01). Runtime deps: `@anthropic-ai/claude-agent-sdk` and
+`ws`, nothing else without a justification line here. Node 24 runs TypeScript directly via type
+stripping, so no build step and no bundler in v1.
+
+```
+src/
+  main.ts          entry: daemon bootstrap, wiring, shutdown
+  config.ts        paths (%USERPROFILE%\.conductor, env-overridable), account dir registry
+  state/
+    logbook.ts     events.jsonl append-only writer, one function per event kind
+    handoffs.ts    handoffs/ folder, one file per finished task
+    playbook.ts    playbook.md read + seed (M1 injects, does not enforce)
+  engine/
+    session.ts     one SDK session: spawn against an account dir, stream, resume
+    finish-task.ts the finish_task in-process tool
+    cut.ts         fresh cut: end session, carry handoff into the next
+    gauge.ts       source stack: experimental usage method, rate_limit_event,
+                   .claude.json file read gated on fetchedAtMs, self-metering floor
+  server/
+    http.ts        HTTP + WebSocket on 127.0.0.1 only
+  cli.ts           thin client: status, gauge, add task, run task, tail log
+```
 
 ### State layer
 
-- [ ] Resolve `%USERPROFILE%\.conductor\` and create it on first run. Path overridable by env var.
-- [ ] `events.jsonl` append-only writer. One line per meaningful event, per the spec's Logbook
+- [x] Resolve `%USERPROFILE%\.conductor\` and create it on first run. Path overridable by env var.
+- [x] `events.jsonl` append-only writer. One line per meaningful event, per the spec's Logbook
       section.
-- [ ] `handoffs/` folder, one file per finished task.
-- [ ] `playbook.md` seeded with a starter page. M1 reads and injects it. M1 does not enforce it.
-- Evidence:
+- [x] `handoffs/` folder, one file per finished task.
+- [x] `playbook.md` seeded with a starter page. M1 reads and injects it. M1 does not enforce it.
+- Evidence: Slice 1, commit `5f338e4` on `feat/m1-engine`. `CONDUCTOR_HOME` override works; two
+  runs against a scratch home proved idempotent seeding (a hand-edited playbook survived run two,
+  `events.jsonl` grew to two `daemon_start` lines). Handoff write/read round trip lossless on all
+  five fields. Logbook survived a forced write failure (EISDIR) by logging to stderr and
+  continuing. Gauge readings type absent-vs-zero correctly (`percent: number | null`) per the S2
+  and S4 rules. Account registry seeds placeholders only; real account dir names stay out of the
+  repo per the scrub rule. Verification output in `docs/notes/m1-slice1-findings.md`.
 
 ### Session runner
 
