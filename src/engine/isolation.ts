@@ -21,7 +21,7 @@
 // A read must not write. `git status` performs an optional index refresh and rewrites the primary
 // `.git/index` when a tracked file's timestamp has moved, which broke the invariant above from
 // inside the code that measures it. Every read-only call here goes through `gitRead`, which passes
-// `--no-optional-locks`. Only worktree add, worktree remove, add, commit and branch -D write.
+// `--no-optional-locks`. Only worktree add, worktree remove, add, commit and update-ref -d write.
 //
 // A name or a path is not proof of ownership. A branch called conductor/task-t1 may be a human's; a
 // folder at the recorded worktree path may be a human's replacement. Nothing is removed unless git's
@@ -181,8 +181,8 @@ function git(args: string[], options: GitOptions): GitText {
  *
  * The flag is on every read here rather than only on `status`, because "does this command refresh
  * the index" is exactly the kind of detail that is true today and different two versions from now.
- * Writing commands (worktree add, worktree remove, add, commit, branch -D) are meant to take locks
- * and do not use this.
+ * Writing commands (worktree add, worktree remove, add, commit, update-ref -d) are meant to take
+ * locks and do not use this.
  */
 function gitRead(args: string[], options: GitOptions): GitText {
   return git(['--no-optional-locks', ...args], options);
@@ -367,23 +367,47 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
   // Through realPath at this end too, not only after creation. An 8.3 short name ("KANESN~1") is a
   // different string and a different length from the same folder's long name, so measuring or
   // comparing the short one answers about a path git will never report back to us.
-  const workspacesDir = join(realPathDeep(config.stateRoot), 'workspaces');
-  const worktreePath = join(workspacesDir, branch.slice(BRANCH_PREFIX.length));
-
-  // Sol's finding 6, which the triage rejected as a finding and kept as a second lock. The primary
-  // guard is loadConfig in src/config.ts: it refuses at startup any state root inside a git checkout,
-  // which is also what keeps the daemon token out of a repository. Sol was not given that file. This
-  // is defence in depth for the case where a Config is built by hand rather than by loadConfig: a
-  // copy of a folder may not live inside the folder it is a copy of, or creating it would change the
-  // very checkout this module promises not to touch.
-  const insideRepo = relative(repoRoot, worktreePath);
-  if (!insideRepo.startsWith(`..${sep}`) && insideRepo !== '..' && !isAbsolute(insideRepo)) {
-    return refuse(
-      `the workspace folder "${worktreePath}" is inside the repository "${repoRoot}". The isolated copy cannot live ` +
-        `inside the folder it is a copy of, because making it would change that folder. Point CONDUCTOR_HOME outside ` +
-        `every git checkout.`,
+  //
+  // Sol's finding 6, which the triage rejected as a finding and kept as a second lock, then his
+  // confirmation pass reopened. The primary guard is loadConfig in src/config.ts: it refuses at
+  // startup any state root inside a git checkout, which is also what keeps the daemon token out of a
+  // repository. This is defence in depth for a Config built by hand rather than by loadConfig: a copy
+  // of a folder may not live inside the folder it is a copy of, or making it would change the very
+  // checkout this module promises not to touch.
+  //
+  // The confirmation pass caught the hole: resolving only the state root and then appending
+  // "workspaces/<id>" lexically is the same 8.3 mistake in junction form. A junction at
+  // <stateRoot>/workspaces can point at a directory inside the repository, and the lexical path stays
+  // innocently outside it while `worktree add` writes through the junction and into the user's
+  // checkout. So the check runs twice: once lexically, before anything is created, and once against
+  // the real path of the workspaces directory, which is also the path that goes in the record.
+  const containmentRefusal = (path: string, lexical?: string): string | null => {
+    const inside = relative(repoRoot, path);
+    if (inside.startsWith(`..${sep}`) || inside === '..' || isAbsolute(inside)) return null;
+    return (
+      `the workspace folder "${path}" is inside the repository "${repoRoot}"` +
+      (lexical && lexical !== path ? ` (reached through "${lexical}", which is a link into that repository)` : '') +
+      `. The isolated copy cannot live inside the folder it is a copy of, because making it would change that folder. ` +
+      `Point CONDUCTOR_HOME outside every git checkout, and check that nothing under it links back into one.`
     );
+  };
+
+  const leaf = branch.slice(BRANCH_PREFIX.length);
+  const lexicalWorkspacesDir = join(realPathDeep(config.stateRoot), 'workspaces');
+  const lexicalRefusal = containmentRefusal(join(lexicalWorkspacesDir, leaf));
+  if (lexicalRefusal) return refuse(lexicalRefusal);
+
+  // Created before the real path can be read, because a path that is not on disk has no real path.
+  // Only <stateRoot>/workspaces is created here, and only ever under Conductor's own state root.
+  try {
+    mkdirSync(lexicalWorkspacesDir, { recursive: true });
+  } catch (err) {
+    return refuse(`the workspace folder "${lexicalWorkspacesDir}" could not be created, so there is nowhere to put the copy: ${String(err)}`);
   }
+  const workspacesDir = realPath(lexicalWorkspacesDir);
+  const worktreePath = join(workspacesDir, leaf);
+  const resolvedRefusal = containmentRefusal(worktreePath, join(lexicalWorkspacesDir, leaf));
+  if (resolvedRefusal) return refuse(resolvedRefusal);
 
   if (existsSync(worktreePath)) {
     return refuse(
@@ -402,7 +426,6 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
   // Measured before the copy exists, so the numbers describe the folder the human is looking at.
   const { modifiedTracked, untracked } = dirtyCounts(repoRoot);
 
-  mkdirSync(workspacesDir, { recursive: true });
   const add = git(['worktree', 'add', '-b', branch, worktreePath, baseCommit], { cwd: repoRoot });
   if (!add.ok) {
     // A failed `git worktree add` can still leave the folder, the metadata and the branch behind,
@@ -459,6 +482,12 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
  * if `git worktree add -b` just created it, and a branch git just created points at the base commit
  * and nothing else. Any other tip means somebody else's commits are on it, so it stays, reflog and
  * all, and the refusal names it rather than quietly leaving litter.
+ *
+ * The confirmation pass then pointed out that reading the tip and deleting the branch were two
+ * commands, so the branch could be replaced between them and the replacement deleted. `git update-ref
+ * -d <ref> <expected-tip>` is git's own compare-and-delete: it takes the ref lock, checks the tip is
+ * still what we saw, and refuses otherwise. That closes the gap between the check and the deletion
+ * rather than narrowing it.
  */
 function cleanUpFailedAdd(repoRoot: string, worktreePath: string, branch: string, baseCommit: string): string {
   const ref = `refs/heads/${branch}`;
@@ -467,7 +496,16 @@ function cleanUpFailedAdd(repoRoot: string, worktreePath: string, branch: string
   const notes: string[] = [];
   const tip = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot }).stdout.trim();
   if (tip && tip === baseCommit) {
-    git(['branch', '-D', branch], { cwd: repoRoot });
+    const deleted = git(['update-ref', '-d', ref, baseCommit], { cwd: repoRoot });
+    if (!deleted.ok) {
+      const now = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot }).stdout.trim();
+      if (now) {
+        notes.push(
+          `the branch "${branch}" moved to ${now.slice(0, 12)} between the moment Conductor looked at it and the moment it ` +
+            `tried to delete it, so it is no longer the branch git created here and it was left alone`,
+        );
+      }
+    }
   } else if (tip) {
     notes.push(
       `the branch "${branch}" points at ${tip.slice(0, 12)} rather than the commit the copy was to be made from, ` +
@@ -564,11 +602,20 @@ export function sealWorkspace(config: Config, workspace: Workspace): SealResult 
 
 // --- discarding --------------------------------------------------------------
 
-/** The worktree entries git itself knows about, as path -> branch ref (or null when detached). */
-function registeredWorktrees(repoRoot: string): Map<string, string | null> {
+/**
+ * The worktree entries git itself knows about, as path -> branch ref (or null when detached).
+ *
+ * Null, never an empty map, when git could not answer. That distinction is the defect the
+ * confirmation pass found in the previous fix round: an empty map reads as "git says there are no
+ * worktrees", which is an authoritative statement of absence, and a failed `git worktree list` is the
+ * opposite of that. Turning the second into the first let discard report success over a repository it
+ * had not been able to look at, and findWorkspace then treated that success as final. Every caller
+ * below handles null as its own case.
+ */
+function registeredWorktrees(repoRoot: string): Map<string, string | null> | null {
   const out = new Map<string, string | null>();
   const listed = gitRead(['worktree', 'list', '--porcelain'], { cwd: repoRoot });
-  if (!listed.ok) return out;
+  if (!listed.ok) return null;
   let path: string | null = null;
   for (const line of listed.stdout.split('\n')) {
     const text = line.trimEnd();
@@ -599,6 +646,13 @@ function registeredWorktrees(repoRoot: string): Map<string, string | null> {
  * is not ours, so nothing is removed and nothing is deleted, and the answer says so. The unscoped
  * `git worktree prune` is gone: it would deregister an unrelated worktree whose drive happens to be
  * disconnected. `git worktree remove` cleans up its own metadata and we confirm that by asking.
+ *
+ * Three things the confirmation pass added. The branch tip is read during the ownership check and the
+ * deletion is `update-ref -d <ref> <that tip>`, so the delete either happens to the branch we
+ * confirmed or does not happen. A failed `git worktree list` is its own answer, not an empty one:
+ * "git could not say" stops the discard rather than passing for "there is nothing there". And a
+ * folder at the recorded path that git does not register gets its own sentence, because no removal
+ * ran and claiming one did would be a small lie about the one operation undo rests on.
  */
 export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | string): DiscardResult {
   const workspace = typeof workspaceOrTaskId === 'string' ? findWorkspace(config, workspaceOrTaskId) : workspaceOrTaskId;
@@ -613,6 +667,13 @@ export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | 
 
   const ref = `refs/heads/${workspace.branch}`;
   const registered = registeredWorktrees(workspace.repoRoot);
+  if (registered === null) {
+    return fail(
+      `git could not read the worktree metadata in "${workspace.repoRoot}", so Conductor cannot tell whether the copy at ` +
+        `"${workspace.worktreePath}" is the one it made. Nothing was removed and the branch "${workspace.branch}" was left ` +
+        `alone. Fix whatever is wrong with that repository and discard again.`,
+    );
+  }
   const listedHere = registered.has(workspace.worktreePath);
   const branchThere = registered.get(workspace.worktreePath) ?? null;
   // Ours means: git registers a worktree at that exact path, with that exact branch checked out.
@@ -626,6 +687,11 @@ export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | 
     );
   }
 
+  // Read here, in the same breath as the ownership confirmation above and before anything is removed,
+  // because this is the value the branch deletion at the end compares against. Reading it after the
+  // removal instead is what let a branch be replaced in between and the replacement deleted.
+  const ownedTip = ours ? gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).stdout.trim() : '';
+
   if (ours) {
     const removed = git(['worktree', 'remove', '--force', workspace.worktreePath], { cwd: workspace.repoRoot });
     if (!removed.ok) {
@@ -634,30 +700,61 @@ export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | 
   }
   // Verified, not assumed. Removal reporting success while the folder survives is the Windows case.
   if (existsSync(workspace.worktreePath)) {
+    if (!ours) {
+      // Nothing was removed here, so saying "git reported the worktree removed" would describe a
+      // command that never ran. What is actually true is smaller and stranger: there is a folder
+      // where our copy used to be and git does not think it is a worktree at all.
+      return fail(
+        `there is a folder at "${workspace.worktreePath}", where Conductor recorded its copy, but git does not register a ` +
+          `worktree there, so nothing was removed and Conductor cannot tell whose folder it is. The branch ` +
+          `"${workspace.branch}" was left alone too. Look at that folder and delete it by hand if it really is leftover.`,
+      );
+    }
     return fail(
       `git reported the worktree removed but "${workspace.worktreePath}" is still on disk, most likely a file lock. ` +
         `Nothing else was changed and the branch "${workspace.branch}" was left alone. Close whatever is holding it and try again.`,
     );
   }
   // Asked, not pruned. `git worktree remove` deregisters what it removes; if git still lists our
-  // entry then the removal did not finish, and saying so beats reaching for a repo-wide prune.
-  if (ours && registeredWorktrees(workspace.repoRoot).has(workspace.worktreePath)) {
-    return fail(
-      `git still lists a worktree at "${workspace.worktreePath}" after removing it, so its metadata is not cleaned up. ` +
-        `The branch "${workspace.branch}" was left alone. Run "git worktree prune" in "${workspace.repoRoot}" yourself if that folder really is gone.`,
-    );
+  // entry then the removal did not finish, and saying so beats reaching for a repo-wide prune. A
+  // second listing that fails is not confirmation of anything, so it is not treated as absence.
+  if (ours) {
+    const after = registeredWorktrees(workspace.repoRoot);
+    if (after === null) {
+      return fail(
+        `git worktree remove reported success for "${workspace.worktreePath}" and the folder is gone, but git could not be ` +
+          `read afterwards to confirm its metadata went with it, so the discard is unconfirmed. The branch ` +
+          `"${workspace.branch}" was left alone. Fix that repository and discard again.`,
+      );
+    }
+    if (after.has(workspace.worktreePath)) {
+      return fail(
+        `git still lists a worktree at "${workspace.worktreePath}" after removing it, so its metadata is not cleaned up. ` +
+          `The branch "${workspace.branch}" was left alone. Run "git worktree prune" in "${workspace.repoRoot}" yourself if that folder really is gone.`,
+      );
+    }
   }
 
   // Only now, only this exact name, and only when the metadata above said the worktree was ours.
   // Mere existence of a branch with our name proves nothing: the record can outlive the worktree,
-  // and a human is free to create a branch of any name afterwards.
+  // and a human is free to create a branch of any name afterwards. `update-ref -d` with the tip read
+  // during that ownership check makes the delete conditional on the branch still being the one we
+  // confirmed, so a branch recreated at the same name while the worktree was being removed survives.
   let note: string | undefined;
-  if (ours) {
-    const deleted = git(['branch', '-D', workspace.branch], { cwd: workspace.repoRoot });
-    if (!deleted.ok && gitRead(['show-ref', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).ok) {
-      return fail(`the worktree is gone but the branch "${workspace.branch}" could not be deleted: ${deleted.stderr.trim()}`);
+  if (ours && ownedTip) {
+    const deleted = git(['update-ref', '-d', ref, ownedTip], { cwd: workspace.repoRoot });
+    if (!deleted.ok) {
+      const now = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).stdout.trim();
+      if (now && now !== ownedTip) {
+        return fail(
+          `the copy at "${workspace.worktreePath}" is gone, but the branch "${workspace.branch}" now points at ` +
+            `${now.slice(0, 12)} rather than the ${ownedTip.slice(0, 12)} it held a moment ago, so somebody else moved or ` +
+            `recreated it and it was left alone. Delete it yourself if it is leftover.`,
+        );
+      }
+      if (now) return fail(`the worktree is gone but the branch "${workspace.branch}" could not be deleted: ${deleted.stderr.trim()}`);
     }
-  } else if (gitRead(['show-ref', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).ok) {
+  } else if (!ours && gitRead(['show-ref', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).ok) {
     note =
       `git had no worktree registered at "${workspace.worktreePath}", so the copy was already gone and nothing was removed. ` +
       `A branch named "${workspace.branch}" exists, but Conductor cannot confirm from git's metadata that it is the one it ` +
@@ -750,14 +847,20 @@ export function describeWorkspace(workspace: Workspace): string {
     lines.push('  report on it. So it cannot say whether the copy matches your folder. What is certain is the commit');
     lines.push('  above: the copy is made from that and holds nothing you have not committed.');
   } else {
+    // Past tense on purpose, and this is Sol's finding 9 answered by wording rather than by code.
+    // The counts were taken from the user's folder in the moment before the copy was made. That
+    // folder can change a second later, and no number of re-reads makes two git commands into one
+    // observation, so the honest thing is to claim exactly what was observed and date it. The copy
+    // itself is never wrong: it is made from the commit named above.
     const lacks: string[] = [];
-    if (w.modifiedTracked > 0) lacks.push(`${w.modifiedTracked} tracked file(s) you have changed but not committed`);
+    if (w.modifiedTracked > 0) lacks.push(`${w.modifiedTracked} tracked file(s) you had changed but not committed`);
     if (w.untracked > 0) lacks.push(`${w.untracked} untracked file(s)`);
     if (lacks.length > 0) {
-      lines.push(`  the copy is made from the commit above, so it does NOT contain ${lacks.join(', and ')}.`);
+      lines.push(`  the copy is made from the commit above, so it did not contain ${lacks.join(', and ')} at that moment.`);
       lines.push('  the task starts from that commit. Commit the work first if the task needs to see it.');
     } else {
-      lines.push('  your folder has no uncommitted changes, so the copy matches what you are looking at.');
+      lines.push('  your folder had no uncommitted changes when the copy was made, so the copy matched it at that moment.');
+      lines.push('  anything you have changed since then is not in the copy.');
     }
     lines.push('  git hides files marked assume-unchanged or skip-worktree, so edits to those are not in that count.');
   }

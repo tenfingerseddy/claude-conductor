@@ -6,9 +6,10 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 const ROOT = join(tmpdir(), 'cond-iso');
 const STATE = join(ROOT, 'state');
@@ -592,6 +593,154 @@ say('\n=== 15. finding 6 (rejected by triage): the one-line second guard ===');
   process.env['CONDUCTOR_HOME'] = STATE;
   say(`  loadConfig said: ${threw || 'NOTHING, it accepted a state root inside a checkout'}`);
   check('loadConfig is the primary guard and refuses first', threw.includes('inside the git checkout'));
+}
+
+// ================================================================================
+// Sol's confirmation pass after the first fix round. Five findings closed, four partial, one new
+// defect. These are the reproductions for the second round; 17, 18 and 19 fail against commit
+// f1ad8bd and pass against the fix.
+// ================================================================================
+
+// --- 16. residuals 2 and 3: deleting a branch is now compare-and-delete ----------------
+
+say('\n=== 16. residuals 2 and 3: update-ref -d is a compare-and-delete ===');
+{
+  const R = join(ROOT, 'r23');
+  const base = newRepo(R);
+  writeFileSync(join(R, 'a.txt'), 'second\n');
+  sh(R, ['commit', '-q', '-am', 'second']);
+  const moved = sh(R, ['rev-parse', 'HEAD']).trim();
+  sh(R, ['branch', 'demo', moved]);
+
+  // The primitive itself. This is what closes the gap between "the branch is still the one we
+  // confirmed" and "delete it": git takes the ref lock and checks the tip inside that lock.
+  const wrong = shSoft(R, ['update-ref', '-d', 'refs/heads/demo', base]);
+  say(`  wrong expected tip: exit ${wrong.code}  ${wrong.err.trim()}`);
+  check('update-ref -d refuses when the expected tip is wrong', wrong.code !== 0);
+  check('the branch survives that refusal', shSoft(R, ['rev-parse', '--verify', '--quiet', 'refs/heads/demo']).out.trim() === moved);
+
+  const right = shSoft(R, ['update-ref', '-d', 'refs/heads/demo', moved]);
+  say(`  right expected tip: exit ${right.code}`);
+  check('update-ref -d deletes when the expected tip matches', right.code === 0);
+  check('the branch is gone afterwards', shSoft(R, ['rev-parse', '--verify', '--quiet', 'refs/heads/demo']).out.trim() === '');
+  check('its reflog went with it', !existsSync(join(R, '.git', 'logs', 'refs', 'heads', 'demo')));
+
+  // And the module really uses it. The race window this closes is sub-second and inside a single
+  // `git worktree remove`, so there is no hook to fire in it and no way to stage it from outside;
+  // what can be pinned is that no unconditional `branch -D` is left anywhere in the file.
+  const source = readFileSync(fileURLToPath(new URL('../../src/engine/isolation.ts', import.meta.url)), 'utf8');
+  check('isolation.ts no longer runs an unconditional branch -D', !/'branch',\s*'-D'/.test(source));
+  check('isolation.ts deletes branches with update-ref -d', (source.match(/'update-ref',\s*'-d'/g) ?? []).length === 2);
+}
+
+// --- 17. residual 6: a junction under the state root must not reach into the repo -------
+
+say('\n=== 17. residual 6: a junction at <stateRoot>/workspaces cannot smuggle the copy into the repo ===');
+{
+  const R = join(ROOT, 'r6');
+  newRepo(R);
+  const stateInside = join(ROOT, 'r6-state');
+  const target = join(R, 'hidden');
+  mkdirSync(stateInside, { recursive: true });
+  mkdirSync(target, { recursive: true });
+  // A junction, not a symlink: Windows allows these without administrator rights, which is exactly
+  // why this is a real bypass rather than a theoretical one.
+  symlinkSync(target, join(stateInside, 'workspaces'), 'junction');
+  say(`  ${join(stateInside, 'workspaces')} -> ${realpathSync.native(join(stateInside, 'workspaces'))}`);
+  check('the junction really resolves inside the repository', realpathSync.native(join(stateInside, 'workspaces')).startsWith(realpathSync.native(R)));
+
+  const rigged = { ...config, stateRoot: stateInside };
+  const r = iso.createWorkspace(rigged, { id: 'r6', cwd: R });
+  say(`  create said: ${r.ok ? 'CREATED THROUGH THE JUNCTION' : r.reason}`);
+  check('createWorkspace refuses a workspace path that resolves inside the repository', r.ok === false);
+  check('the refusal says the path is inside the repository', r.ok === false && r.reason.includes('is inside the repository'));
+  check('nothing was written through the junction', !existsSync(join(target, 'r6')));
+  check("the user's folder is still clean", sh(R, ['status', '--porcelain']).trim() === '');
+  check('no branch was created', shSoft(R, ['show-ref', '--verify', '--quiet', 'refs/heads/conductor/task-r6']).code !== 0);
+  check('no worktree was registered', sh(R, ['worktree', 'list', '--porcelain']).trim().split('\n\n').length === 1);
+}
+
+// --- 18. the new defect: a failed `git worktree list` is not an empty one ----------------
+
+say('\n=== 18. new defect: git failing to answer must not read as "there is nothing there" ===');
+{
+  const R = join(ROOT, 'r10');
+  newRepo(R);
+  const made = iso.createWorkspace(config, { id: 'r10', cwd: R });
+  check('r10 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    // The copy's folder goes away outside Conductor, so the recorded path is absent...
+    rmSync(w.worktreePath, { recursive: true, force: true });
+    // ...and the repository is then in a state where git cannot answer any question about it.
+    writeFileSync(join(R, '.git', 'config'), readFileSync(join(R, '.git', 'config'), 'utf8') + '[core\nnot a valid line\n');
+    const listFails = shSoft(R, ['worktree', 'list', '--porcelain']);
+    say(`  git worktree list exit ${listFails.code}: ${(listFails.err || listFails.out).trim().split('\n')[0]}`);
+    check('git worktree list really does fail here', listFails.code !== 0);
+
+    const d = iso.discardWorkspace(config, 'r10');
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (${d.note})` : ''}` : d.reason}`);
+    check('discard does not report success over a repository git could not read', d.ok === false);
+    check('the refusal says git could not read the metadata', d.ok === false && d.reason.includes('could not read the worktree metadata'));
+    check('the workspace is still findable, so a later discard can retry', iso.findWorkspace(config, 'r10') !== null);
+  }
+}
+
+// --- 19. the false removal sentence -------------------------------------------------------
+
+say('\n=== 19. a folder at the recorded path that git does not register: no removal ran ===');
+{
+  const R = join(ROOT, 'r11');
+  newRepo(R);
+  const made = iso.createWorkspace(config, { id: 'r11', cwd: R });
+  check('r11 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    // Removed properly outside Conductor, so no metadata is left...
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    // ...and then somebody puts an ordinary folder of their own back at that path.
+    mkdirSync(w.worktreePath, { recursive: true });
+    const theirs = join(w.worktreePath, 'somebody-elses-notes.txt');
+    writeFileSync(theirs, 'not conductor work\n');
+
+    const d = iso.discardWorkspace(config, 'r11');
+    say(`  discard said: ${d.ok ? 'DISCARDED' : d.reason}`);
+    check('discard refuses rather than claiming a removal', d.ok === false);
+    check('it does not claim git reported a removal', d.ok === false && !d.reason.includes('git reported the worktree removed'));
+    check('it says git does not register a worktree there', d.ok === false && d.reason.includes('git does not register a'));
+    check("the stranger's folder was not touched", existsSync(theirs));
+    check('the branch was left alone', shSoft(R, ['show-ref', '--verify', '--quiet', `refs/heads/${w.branch}`]).code === 0);
+  }
+}
+
+// --- 20. residual 9: the labels claim only what was observed --------------------------------
+
+say('\n=== 20. residual 9: dirty-count wording is past tense, anchored to creation time ===');
+{
+  const Rd = join(ROOT, 'r9d');
+  newRepo(Rd);
+  writeFileSync(join(Rd, 'a.txt'), 'edited\n');
+  writeFileSync(join(Rd, 'new.txt'), 'untracked\n');
+  const dirty = iso.createWorkspace(config, { id: 'r9d', cwd: Rd });
+  check('r9d create ok', dirty.ok === true, dirty.ok ? '' : dirty.reason);
+  if (dirty.ok) {
+    const text = iso.describeWorkspace(dirty.workspace);
+    say(text.split('\n').slice(6, 10).map((l) => `  |${l}`).join('\n'));
+    check('the dirty wording is past tense', text.includes('did not contain') && text.includes('at that moment'));
+    check('the dirty wording no longer says "does NOT contain"', !text.includes('does NOT contain'));
+  }
+
+  const Rc = join(ROOT, 'r9c');
+  newRepo(Rc);
+  const clean = iso.createWorkspace(config, { id: 'r9c', cwd: Rc });
+  check('r9c create ok', clean.ok === true, clean.ok ? '' : clean.reason);
+  if (clean.ok) {
+    const text = iso.describeWorkspace(clean.workspace);
+    say(text.split('\n').slice(6, 10).map((l) => `  |${l}`).join('\n'));
+    check('the clean wording is anchored to creation time', text.includes('had no uncommitted changes when the copy was made'));
+    check('it no longer claims the copy matches what the user is looking at now', !text.includes('matches what you are looking at'));
+    check('it says changes since then are not in the copy', text.includes('not in the copy'));
+  }
 }
 
 say('\n=== logbook lines written ===');
