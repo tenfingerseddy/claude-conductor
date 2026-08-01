@@ -189,19 +189,33 @@ function gitRead(args: string[], options: GitOptions): GitText {
 }
 
 /**
- * The one spelling of a path this file trusts.
+ * The one spelling of a path this file trusts, or null when the operating system would not give it.
  *
  * Found the hard way in slice A: git's `--show-toplevel` answers with the true long path, while a
  * caller can hand us the same folder as an 8.3 short name ("KANESN~1"). Comparing the two with
  * `relative()` said the task folder was outside its own repository, and undo silently did nothing.
  * Both ends of every comparison in this file go through here.
  */
-function realPath(path: string): string {
+function realPathStrict(path: string): string | null {
   try {
     return realpathSync.native(resolve(path));
   } catch {
-    return resolve(path);
+    return null;
   }
+}
+
+/**
+ * realPathStrict with a lexical fallback, for the uses where a best-effort spelling is good enough:
+ * log lines, messages, a path we are about to hand to git anyway.
+ *
+ * Sol's final pass, item 2. This fallback used to be the only spelling available, and it reached the
+ * containment check, where it is not good enough at all. `resolve()` cannot see a junction, so a
+ * failed canonicalisation degraded into a lexical answer that says "outside the repository" about a
+ * path nobody has actually resolved. Unknown reading as contained is the same shape of lie as unknown
+ * reading as clean. Wherever containment is decided, realPathStrict is used and a null refuses.
+ */
+function realPath(path: string): string {
+  return realPathStrict(path) ?? resolve(path);
 }
 
 /**
@@ -246,6 +260,27 @@ function headRef(repoRoot: string): string | null {
   const result = gitRead(['symbolic-ref', '--quiet', 'HEAD'], { cwd: repoRoot });
   const ref = result.stdout.trim();
   return result.ok && ref ? ref : null;
+}
+
+/**
+ * What a branch ref points at: a commit, nothing, or an answer git would not give.
+ *
+ * Sol's final pass, item 1. `rev-parse --verify --quiet` exits non-zero for both "no such branch" and
+ * "this repository will not answer", and taking `.stdout.trim()` off it flattened the second into the
+ * first. An empty string then read as "there is no branch to delete", so discard could remove a
+ * worktree, silently skip the deletion, and log a clean success. The three cases are separated here
+ * so no caller can collapse them again: an absent ref exits 1 with nothing on either stream, and
+ * anything git actually complains about arrives on stderr.
+ */
+type BranchTip = { state: 'present'; hash: string } | { state: 'absent' } | { state: 'unreadable'; detail: string };
+
+function branchTip(repoRoot: string, ref: string): BranchTip {
+  const result = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot });
+  const hash = result.stdout.trim();
+  if (result.ok) return hash ? { state: 'present', hash } : { state: 'unreadable', detail: 'git exited cleanly but named no commit' };
+  const detail = result.stderr.trim();
+  if (!detail && !hash) return { state: 'absent' };
+  return { state: 'unreadable', detail: detail || 'git could not read it' };
 }
 
 // --- refusals ----------------------------------------------------------------
@@ -341,6 +376,15 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
   const cwd = realPath(task.cwd);
   const repoRoot = gitRepoRoot(cwd);
   if (!repoRoot) return refuse(`could not resolve the git work tree for "${cwd}"`);
+  // Containment below is decided by comparing this path with the workspace path, so a repository root
+  // that the operating system would not canonicalise is not a usable end of that comparison. Refuse
+  // rather than compare against a spelling nobody confirmed; nothing has been created at this point.
+  if (realPathStrict(repoRoot) === null) {
+    return refuse(
+      `the repository root "${repoRoot}" could not be resolved to a real path, so Conductor cannot prove the isolated copy ` +
+        `would live outside it. Nothing was created. Check that the folder is readable and try again.`,
+    );
+  }
 
   const baseCommit = headCommit(repoRoot);
   if (!baseCommit) return refuse(`the repository "${repoRoot}" has no commits yet, so there is nothing to copy from`);
@@ -404,7 +448,16 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
   } catch (err) {
     return refuse(`the workspace folder "${lexicalWorkspacesDir}" could not be created, so there is nowhere to put the copy: ${String(err)}`);
   }
-  const workspacesDir = realPath(lexicalWorkspacesDir);
+  // Strict, not best-effort. This is the resolution the junction check depends on, and a lexical
+  // fallback here would answer "outside the repository" about a path that was never resolved.
+  const workspacesDir = realPathStrict(lexicalWorkspacesDir);
+  if (workspacesDir === null) {
+    return refuse(
+      `the workspace folder "${lexicalWorkspacesDir}" could not be resolved to a real path, so Conductor cannot tell where it ` +
+        `actually leads and cannot prove the copy would live outside "${repoRoot}". Nothing was created. Check that path, and ` +
+        `any link along it, and try again.`,
+    );
+  }
   const worktreePath = join(workspacesDir, leaf);
   const resolvedRefusal = containmentRefusal(worktreePath, join(lexicalWorkspacesDir, leaf));
   if (resolvedRefusal) return refuse(resolvedRefusal);
@@ -494,21 +547,33 @@ function cleanUpFailedAdd(repoRoot: string, worktreePath: string, branch: string
   if (existsSync(worktreePath)) git(['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot });
 
   const notes: string[] = [];
-  const tip = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot }).stdout.trim();
-  if (tip && tip === baseCommit) {
+  const tip = branchTip(repoRoot, ref);
+  if (tip.state === 'unreadable') {
+    // A tip git would not give is not the same as no branch. Saying nothing here would leave litter
+    // Conductor knows it cannot account for, and the next attempt would refuse with "already exists".
+    notes.push(
+      `Conductor could not read the branch "${branch}" to tell whether git had just created it (${tip.detail}), so nothing ` +
+        `was deleted; check for that branch and remove it by hand if it is there`,
+    );
+  } else if (tip.state === 'present' && tip.hash === baseCommit) {
     const deleted = git(['update-ref', '-d', ref, baseCommit], { cwd: repoRoot });
     if (!deleted.ok) {
-      const now = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot }).stdout.trim();
-      if (now) {
+      const now = branchTip(repoRoot, ref);
+      if (now.state === 'unreadable') {
         notes.push(
-          `the branch "${branch}" moved to ${now.slice(0, 12)} between the moment Conductor looked at it and the moment it ` +
-            `tried to delete it, so it is no longer the branch git created here and it was left alone`,
+          `deleting the branch "${branch}" failed and Conductor could not then read it to see whether it is still there ` +
+            `(${now.detail}), so check for it and remove it by hand if it is`,
+        );
+      } else if (now.state === 'present' && now.hash !== baseCommit) {
+        notes.push(
+          `the branch "${branch}" moved to ${now.hash.slice(0, 12)} between the moment Conductor looked at it and the moment ` +
+            `it tried to delete it, so it is no longer the branch git created here and it was left alone`,
         );
       }
     }
-  } else if (tip) {
+  } else if (tip.state === 'present') {
     notes.push(
-      `the branch "${branch}" points at ${tip.slice(0, 12)} rather than the commit the copy was to be made from, ` +
+      `the branch "${branch}" points at ${tip.hash.slice(0, 12)} rather than the commit the copy was to be made from, ` +
         `so it is not the one Conductor just created and it was left alone`,
     );
   }
@@ -690,7 +755,22 @@ export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | 
   // Read here, in the same breath as the ownership confirmation above and before anything is removed,
   // because this is the value the branch deletion at the end compares against. Reading it after the
   // removal instead is what let a branch be replaced in between and the replacement deleted.
-  const ownedTip = ours ? gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).stdout.trim() : '';
+  //
+  // A tip git will not give up stops the discard here, while nothing has happened yet. Undo is one
+  // operation, not two: removing the copy and then finding out we never knew whether a branch was
+  // there would leave a half-done job reported as a whole one.
+  let ownedTip = '';
+  if (ours) {
+    const tip = branchTip(workspace.repoRoot, ref);
+    if (tip.state === 'unreadable') {
+      return fail(
+        `git would not say what the branch "${workspace.branch}" points at (${tip.detail}), so Conductor cannot delete it ` +
+          `safely and will not remove the copy at "${workspace.worktreePath}" while half the job is unknown. Nothing was ` +
+          `changed. Fix that repository and discard again.`,
+      );
+    }
+    if (tip.state === 'present') ownedTip = tip.hash;
+  }
 
   if (ours) {
     const removed = git(['worktree', 'remove', '--force', workspace.worktreePath], { cwd: workspace.repoRoot });
@@ -738,27 +818,55 @@ export function discardWorkspace(config: Config, workspaceOrTaskId: Workspace | 
   // Only now, only this exact name, and only when the metadata above said the worktree was ours.
   // Mere existence of a branch with our name proves nothing: the record can outlive the worktree,
   // and a human is free to create a branch of any name afterwards. `update-ref -d` with the tip read
-  // during that ownership check makes the delete conditional on the branch still being the one we
-  // confirmed, so a branch recreated at the same name while the worktree was being removed survives.
+  // during that ownership check makes the delete conditional on the branch still pointing where it
+  // pointed then, so a branch that moved, or was replaced at a different commit, survives.
+  //
+  // The parked limit, stated exactly: this does not survive a branch deleted and recreated at the
+  // same commit inside that window, because the tip git compares is the only evidence there is and
+  // it matches. What is lost in that case is a branch name pointing at a commit that still exists in
+  // the repository, not work. Closing it properly would need a ref transaction spanning `worktree
+  // remove`, which git does not offer.
   let note: string | undefined;
   if (ours && ownedTip) {
     const deleted = git(['update-ref', '-d', ref, ownedTip], { cwd: workspace.repoRoot });
     if (!deleted.ok) {
-      const now = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).stdout.trim();
-      if (now && now !== ownedTip) {
+      const now = branchTip(workspace.repoRoot, ref);
+      // Deletion failed and git will not say whether the branch is still there. The copy is already
+      // gone, so this is a discard that half happened, and it is reported as a failure for exactly
+      // that reason: the alternative is logging a success nobody checked.
+      if (now.state === 'unreadable') {
+        return fail(
+          `the copy at "${workspace.worktreePath}" is gone, but deleting the branch "${workspace.branch}" failed and git ` +
+            `would not then say whether that branch is still there (${now.detail}), so the discard is unconfirmed. Check for ` +
+            `that branch by hand.`,
+        );
+      }
+      if (now.state === 'present' && now.hash !== ownedTip) {
         return fail(
           `the copy at "${workspace.worktreePath}" is gone, but the branch "${workspace.branch}" now points at ` +
-            `${now.slice(0, 12)} rather than the ${ownedTip.slice(0, 12)} it held a moment ago, so somebody else moved or ` +
+            `${now.hash.slice(0, 12)} rather than the ${ownedTip.slice(0, 12)} it held a moment ago, so somebody else moved or ` +
             `recreated it and it was left alone. Delete it yourself if it is leftover.`,
         );
       }
-      if (now) return fail(`the worktree is gone but the branch "${workspace.branch}" could not be deleted: ${deleted.stderr.trim()}`);
+      if (now.state === 'present') {
+        return fail(`the worktree is gone but the branch "${workspace.branch}" could not be deleted: ${deleted.stderr.trim()}`);
+      }
     }
-  } else if (!ours && gitRead(['show-ref', '--verify', '--quiet', ref], { cwd: workspace.repoRoot }).ok) {
-    note =
-      `git had no worktree registered at "${workspace.worktreePath}", so the copy was already gone and nothing was removed. ` +
-      `A branch named "${workspace.branch}" exists, but Conductor cannot confirm from git's metadata that it is the one it ` +
-      `created, so it was left alone. Delete it yourself if it is leftover.`;
+  } else if (!ours) {
+    const leftover = branchTip(workspace.repoRoot, ref);
+    if (leftover.state === 'unreadable') {
+      return fail(
+        `git had no worktree registered at "${workspace.worktreePath}", so nothing was removed, but git would not then say ` +
+          `whether a branch named "${workspace.branch}" is there (${leftover.detail}). Conductor will not call a discard done ` +
+          `on a question it could not get an answer to. Fix that repository and discard again.`,
+      );
+    }
+    if (leftover.state === 'present') {
+      note =
+        `git had no worktree registered at "${workspace.worktreePath}", so the copy was already gone and nothing was removed. ` +
+        `A branch named "${workspace.branch}" exists, but Conductor cannot confirm from git's metadata that it is the one it ` +
+        `created, so it was left alone. Delete it yourself if it is leftover.`;
+    }
   }
 
   logEvent(config, { kind: 'workspace_discarded', taskId: workspace.taskId, branch: workspace.branch, worktreePath: workspace.worktreePath, ok: true, ...(note ? { note } : {}) });

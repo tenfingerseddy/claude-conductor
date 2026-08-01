@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = join(tmpdir(), 'cond-iso');
 const STATE = join(ROOT, 'state');
@@ -741,6 +741,193 @@ say('\n=== 20. residual 9: dirty-count wording is past tense, anchored to creati
     check('it no longer claims the copy matches what the user is looking at now', !text.includes('matches what you are looking at'));
     check('it says changes since then are not in the copy', text.includes('not in the copy'));
   }
+}
+
+// ================================================================================
+// Sol's final pass on 6bf04f1. Two "could not answer" cases still read as done. Both need a git
+// command or a filesystem call to fail in a way this machine will not produce on demand, so they are
+// driven through a stub harness rather than a real repository. Said plainly: sections 21 and 22 are
+// not end-to-end reproductions. Everything above this line is.
+//
+// The harness is a copy of isolation.ts with two seams cut into it by exact-text replacement, loaded
+// as its own module. The control flow being tested is the real one, byte for byte, apart from those
+// two lines; the shipped file is untouched. The same patch applies cleanly to 6bf04f1 and to the fix,
+// which is what lets the same checks run against both.
+// ================================================================================
+
+say('\n=== stub harness: building a seamed copy of isolation.ts ===');
+
+interface GitText {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+}
+type GitHook = (args: string[]) => GitText | null;
+type RealpathHook = (path: string) => string;
+const hooks = globalThis as unknown as { __conductorGitHook?: GitHook; __conductorRealpathHook?: RealpathHook };
+
+const GIT_SEAM = "  const result = spawnSync('git', args, {";
+const REALPATH_SEAM = '    return realpathSync.native(resolve(path));';
+
+function buildHarness(): string {
+  const srcPath = fileURLToPath(new URL('../../src/engine/isolation.ts', import.meta.url));
+  let text = readFileSync(srcPath, 'utf8');
+  const applied: string[] = [];
+
+  function swap(label: string, from: string, to: string): void {
+    const count = text.split(from).length - 1;
+    check(`harness seam "${label}" appears exactly once in isolation.ts`, count === 1, `found ${count}`);
+    text = text.replace(from, to);
+    applied.push(label);
+  }
+
+  // The two seams. Each delegates to the real implementation whenever no hook is installed, so an
+  // unhooked harness run behaves exactly like the module it was copied from.
+  swap(
+    'git',
+    GIT_SEAM,
+    '  const hook = (globalThis as Record<string, unknown>)["__conductorGitHook"] as ((a: string[]) => unknown) | undefined;\n' +
+      '  const hooked = hook ? hook(args) : null;\n' +
+      '  if (hooked) return hooked as { ok: boolean; stdout: string; stderr: string };\n' +
+      GIT_SEAM,
+  );
+  swap(
+    'realpath',
+    REALPATH_SEAM,
+    '    const rp = (globalThis as Record<string, unknown>)["__conductorRealpathHook"] as ((p: string) => string) | undefined;\n' +
+      '    return rp ? rp(resolve(path)) : realpathSync.native(resolve(path));',
+  );
+  // Relative imports have to become absolute, because the copy does not live beside its neighbours.
+  const srcDir = dirname(srcPath);
+  swap('config import', "from '../config.ts'", `from ${JSON.stringify(pathToFileURL(join(srcDir, '..', 'config.ts')).href)}`);
+  swap('logbook import', "from '../state/logbook.ts'", `from ${JSON.stringify(pathToFileURL(join(srcDir, '..', 'state', 'logbook.ts')).href)}`);
+
+  const out = join(ROOT, 'harness', 'isolation.seamed.ts');
+  mkdirSync(dirname(out), { recursive: true });
+  writeFileSync(out, text);
+  say(`  seams applied: ${applied.join(', ')}`);
+  say(`  harness module: ${out}`);
+  return out;
+}
+
+const seamed = await import(pathToFileURL(buildHarness()).href) as typeof iso;
+
+// Sanity: with no hook installed the harness must behave like the real module, or nothing measured
+// through it means anything.
+{
+  const R = join(ROOT, 'h0');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'h0', cwd: R });
+  check('unhooked harness creates a workspace just like the real module', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const d = seamed.discardWorkspace(config, made.workspace);
+    check('unhooked harness discards just like the real module', d.ok === true, d.ok ? '' : d.reason);
+  }
+}
+
+// --- 21. item 1: a tip git will not give must not read as "no branch to delete" ------------
+
+say('\n=== 21. item 1: an unreadable branch tip must stop the discard, not silently skip it ===');
+{
+  const R = join(ROOT, 'h1');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'h1', cwd: R });
+  check('h1 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    const target = `refs/heads/${w.branch}`;
+    // Exactly the shape real git produces when it will not answer: non-zero, nothing on stdout, a
+    // complaint on stderr. `git worktree list` still answers, so ownership is confirmed and the code
+    // reaches the tip read. This is the combination the machine will not stage: a broken loose ref
+    // makes `worktree list` drop the branch line too, which lands in the mismatch refusal instead.
+    hooks.__conductorGitHook = (args) =>
+      args.includes('rev-parse') && args.includes(target) ? { ok: false, stdout: '', stderr: 'fatal: cannot read refs' } : null;
+    const d = seamed.discardWorkspace(config, w);
+    hooks.__conductorGitHook = undefined;
+
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (${d.note})` : ''}` : d.reason}`);
+    check('discard does not report success when the tip could not be read', d.ok === false);
+    check('the refusal says git would not give the tip', d.ok === false && d.reason.includes('would not say what the branch'));
+    // The half-done job is the actual harm: the copy removed, the branch quietly left, logged as done.
+    check('nothing was removed, so the discard is not half done', existsSync(w.worktreePath));
+    check('the branch is still there', shSoft(R, ['show-ref', '--verify', '--quiet', target]).code === 0);
+    check('the workspace is still findable, so a later discard can retry', seamed.findWorkspace(config, 'h1') !== null);
+
+    const good = seamed.discardWorkspace(config, w);
+    check('discard works once git answers again', good.ok === true, good.ok ? '' : good.reason);
+  }
+}
+
+say('--- item 1, second half: a deletion whose outcome cannot be confirmed ---');
+{
+  const R = join(ROOT, 'h2');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'h2', cwd: R });
+  check('h2 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    const target = `refs/heads/${w.branch}`;
+    // The first tip read succeeds, so the discard proceeds and the worktree is removed. Then the
+    // delete fails and the read that would say whether the branch survived fails too.
+    let seenTipReads = 0;
+    hooks.__conductorGitHook = (args) => {
+      if (args[0] === 'update-ref') return { ok: false, stdout: '', stderr: 'error: cannot lock ref' };
+      if (args.includes('rev-parse') && args.includes(target)) {
+        seenTipReads++;
+        if (seenTipReads > 1) return { ok: false, stdout: '', stderr: 'fatal: cannot read refs' };
+      }
+      return null;
+    };
+    const d = seamed.discardWorkspace(config, w);
+    hooks.__conductorGitHook = undefined;
+
+    say(`  tip reads seen: ${seenTipReads}`);
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (${d.note})` : ''}` : d.reason}`);
+    check('both the delete and the follow-up read were exercised', seenTipReads === 2);
+    check('an unconfirmable deletion is a failed discard, not a success', d.ok === false);
+    check('the refusal says the discard is unconfirmed', d.ok === false && d.reason.includes('unconfirmed'));
+    check('it also says the copy is gone, because it is', d.ok === false && d.reason.includes('is gone'));
+    check('the branch really is still there', shSoft(R, ['show-ref', '--verify', '--quiet', target]).code === 0);
+    sh(R, ['branch', '-D', w.branch]);
+  }
+}
+
+// --- 22. item 2: a path that could not be canonicalised is not a containment answer ---------
+
+say('\n=== 22. item 2: a failed canonicalisation must refuse, not fall back to a lexical guess ===');
+{
+  const R = join(ROOT, 'h3');
+  newRepo(R);
+  const stateH3 = join(ROOT, 'h3-state');
+  mkdirSync(join(stateH3, 'workspaces'), { recursive: true });
+  const resolvedWorkspaces = realpathSync.native(join(stateH3, 'workspaces'));
+  // Only this one path fails to resolve; everything else goes to the real call. That is the state
+  // this machine will not produce on demand: a dangling junction fails at mkdir instead, and a
+  // junction loop fails at existsSync, so neither reaches the resolution the containment check uses.
+  hooks.__conductorRealpathHook = (p) => {
+    if (p.toLowerCase() === resolvedWorkspaces.toLowerCase()) throw new Error('EACCES: simulated canonicalisation failure');
+    return realpathSync.native(p);
+  };
+  const r = seamed.createWorkspace({ ...config, stateRoot: stateH3 }, { id: 'h3', cwd: R });
+  hooks.__conductorRealpathHook = undefined;
+
+  say(`  create said: ${r.ok ? 'CREATED ON AN UNRESOLVED PATH' : r.reason}`);
+  check('createWorkspace refuses when the workspace path could not be resolved', r.ok === false);
+  check('the refusal says the path could not be resolved', r.ok === false && r.reason.includes('could not be resolved to a real path'));
+  check('no copy was made', !existsSync(join(resolvedWorkspaces, 'h3')));
+  check('no branch was created', shSoft(R, ['show-ref', '--verify', '--quiet', 'refs/heads/conductor/task-h3']).code !== 0);
+  check("the user's folder is still clean", sh(R, ['status', '--porcelain']).trim() === '');
+
+  // The real-filesystem half of the same guard, which does work end to end: a junction pointing at
+  // nothing must never end in a copy. Both revisions refuse this one, so it is a safety check rather
+  // than a reproduction, and it is here to keep the strict resolution honest about real links.
+  const stateH4 = join(ROOT, 'h4-state');
+  mkdirSync(stateH4, { recursive: true });
+  symlinkSync(join(stateH4, 'no-such-target'), join(stateH4, 'workspaces'), 'junction');
+  const r4 = seamed.createWorkspace({ ...config, stateRoot: stateH4 }, { id: 'h4', cwd: R });
+  say(`  dangling junction: ${r4.ok ? 'CREATED' : r4.reason.slice(0, 140)}`);
+  check('a dangling junction under the state root never ends in a copy', r4.ok === false);
+  check("the user's folder is still clean after that too", sh(R, ['status', '--porcelain']).trim() === '');
 }
 
 say('\n=== logbook lines written ===');
