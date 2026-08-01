@@ -157,15 +157,39 @@ interface GitText {
   stderr: string;
 }
 
+/**
+ * The environment for every git call in this file: the daemon's environment with the whole `GIT_*`
+ * namespace stripped, then only the variables Conductor sets deliberately put back.
+ *
+ * Sol's finding 4. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`,
+ * `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_CEILING_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_INDEX_FILE`
+ * and `GIT_CONFIG_*` all redirect where git reads and writes. Spreading `process.env` wholesale
+ * meant a daemon started from a git hook, or from a shell that exports any of them, would have every
+ * command here answer about a repository other than the one it names: a before-image written into
+ * somebody else's repo, or a restore taken out of one. Deny by default, the same principle as the
+ * rail, and nothing is allowed back through: git finds its exec path, its config and its repository
+ * from the cwd we hand it, which is the only repository this file is entitled to touch.
+ *
+ * `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are stripped with the rest but deliberately not
+ * replaced with an empty file. Stripping is what stops an inherited pair steering us; neutralising
+ * them as well would mean reading the repository differently from the way the user's own git reads
+ * it (`core.longpaths`, `safe.directory`, filters), and the checkpoint has to match what the user
+ * sees. The settings that must not vary are passed per command as `-c` instead, which outranks any
+ * config file.
+ *
+ * The match is case-insensitive because the Windows environment is: `Git_Dir` is `GIT_DIR` there.
+ */
 function gitEnv(options: GitOptions): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    ...(options.indexFile ? { GIT_INDEX_FILE: options.indexFile } : {}),
-    ...(options.identity ? COMMIT_IDENTITY : {}),
-    // Conductor never reaches a remote, and a git call that stops to ask for a password would hang
-    // the daemon rather than fail it.
-    GIT_TERMINAL_PROMPT: '0',
-  };
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^GIT_/i.test(key)) env[key] = value;
+  }
+  if (options.indexFile) env.GIT_INDEX_FILE = options.indexFile;
+  if (options.identity) Object.assign(env, COMMIT_IDENTITY);
+  // Conductor never reaches a remote, and a git call that stops to ask for a password would hang
+  // the daemon rather than fail it.
+  env.GIT_TERMINAL_PROMPT = '0';
+  return env;
 }
 
 /** One git call. Argument array, no shell, output as text. Never throws. */
@@ -909,6 +933,24 @@ function pruneEmptyDirs(dir: string, stopAt: string): void {
   }
 }
 
+/**
+ * One line's verb, and the only place in the preview where authorship is claimed.
+ *
+ * "created by the task" is a fact when a post-image exists and the path is in checkpoint..post-image.
+ * It is a guess in every other case, and Sol failed the first cut of this slice for exactly that:
+ * a preview stating a guess as fact. Under unknown provenance, and for any path the override folded
+ * in, the verb says only what the record supports, which is how the file differs from the checkpoint.
+ * The human then decides, which is the whole point of showing them a list.
+ */
+function verbFor(change: UndoChange, attributed: boolean): string {
+  if (attributed) {
+    if (change.action === 'delete') return 'delete   (created by the task)';
+    return change.why === 'missing' ? 'restore  (deleted by the task)' : 'restore  (changed by the task)';
+  }
+  if (change.action === 'delete') return 'delete   (present now, not in the checkpoint)';
+  return change.why === 'missing' ? 'restore  (in the checkpoint, absent now)' : 'restore  (differs from the checkpoint)';
+}
+
 /** The preview a human reads before answering. Plain lines, no diff, counts at the end. */
 export function describePlan(plan: UndoPlan): string {
   const { record, changes } = plan;
@@ -929,9 +971,11 @@ export function describePlan(plan: UndoPlan): string {
   if (changes.length === 0) {
     lines.push(plan.held.length > 0 ? '  nothing would be changed: every difference is being held back, see below.' : '  nothing to change: the folder already matches the checkpoint.');
   } else {
+    // The held set is what the override folds in. Those paths sit in `changes` and get acted on,
+    // but nothing about them is the task's, so they are described and not attributed.
+    const heldPaths = new Set(plan.held.map((h) => h.path));
     for (const change of changes) {
-      const verb = change.action === 'delete' ? 'delete   (created by the task)' : change.why === 'missing' ? 'restore  (deleted by the task)' : 'restore  (changed by the task)';
-      lines.push(`  ${verb}  ${change.path}`);
+      lines.push(`  ${verbFor(change, plan.provenance === 'post-image' && !heldPaths.has(change.path))}  ${change.path}`);
     }
   }
 
@@ -942,7 +986,10 @@ export function describePlan(plan: UndoPlan): string {
 
   if (plan.held.length > 0) {
     lines.push('');
-    if (plan.override) {
+    if (plan.override && plan.provenance === 'unknown') {
+      lines.push(`  OVERRIDE GIVEN: there is no post-image, so the ${plan.held.length} path(s) below cannot be attributed to`);
+      lines.push('  the task or to anybody else. They will be changed anyway:');
+    } else if (plan.override) {
       lines.push(`  OVERRIDE GIVEN: the ${plan.held.length} path(s) below are NOT the task's work and will be changed anyway:`);
     } else if (plan.provenance === 'unknown') {
       lines.push(`  held back, provenance unknown (${plan.held.length}):`);
@@ -951,7 +998,11 @@ export function describePlan(plan: UndoPlan): string {
     }
     for (const h of plan.held) lines.push(`    ${h.action === 'delete' ? 'would delete ' : 'would restore'}  ${h.path}`);
     if (!plan.override) {
-      lines.push('  These are somebody else\'s changes, not the task\'s. Undo will not touch them. To include exactly');
+      lines.push(
+        plan.provenance === 'post-image'
+          ? '  These are somebody else\'s changes, not the task\'s. Undo will not touch them. To include exactly'
+          : '  Whose changes these are is not recorded, so undo will not touch them. To include exactly',
+      );
       lines.push('  the paths listed above, send "overrideChangedAfterTask": true, or pass');
       lines.push('  --override-changed-after-task on the command line.');
     }
