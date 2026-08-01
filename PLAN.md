@@ -295,10 +295,20 @@ src/
 
 ### Review and land
 
-- [ ] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
+- [x] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
 - [ ] Findings resolved or explicitly parked with a reason.
 - [ ] Merge to main.
-- Evidence:
+- Evidence: Three passes run 2026-08-01 (security, loop correctness, gauge honesty), raw output
+  and a triaged summary in `docs/notes/sol-review-m1-*.md`, commit `574bf90`. Twenty findings,
+  none judged false positive, one already known. The serious five: (1) the WS/HTTP channel has no
+  auth, no Origin check, and content-type-blind JSON parsing, so a loopback-reachable page could
+  queue, start, and self-approve an autonomous task; (2) interpreter wrappers (`cmd /c del`,
+  `node -e`, `git -C x reset --hard`) classify as safe and defeat the destructive rail;
+  (3) a failed live probe leaves the last reading cached and still labelled `official, live`, the
+  gauge's one unforgivable lie; (4) self-metering has no rolling window, letting calibration
+  learn nonsense; (5) a session that dies without `finish_task` still consumes the task, drops
+  the carry, and logs a cut that never happened. Fix slice covers all twenty plus the four
+  finish-line wrinkles.
 
 **M1 finish line:** a real task runs end to end in `~/repos/nexwave-apps`. Claude works it, calls
 `finish_task`, the context is cut on purpose, the next task starts clean with the handoff note, the
@@ -397,3 +407,12 @@ Append here when a design call is made during the build. Date, decision, reason,
   denial with no door attached logs `door: null`. Reason: the engine cannot know a door is real;
   logging the difference between "denied by human" and "denied because nobody was watching" is
   what the review loop will need.
+- 2026-08-01. The destructive rail flips from blocklist to deny-by-default (architect call after
+  Sol pass 1). Any command whose effect the classifier cannot positively vouch for is treated as
+  risky: approval in attended, denied in autonomous. Reason: Sol showed interpreter wrappers walk
+  through any blocklist; a list of bad strings can never be complete, a list of vouched-safe
+  shapes can be honest. D9 stands unweakened.
+- 2026-08-01. First real queue content after M1 merges: the assessment program in nexwave-apps
+  (`assessment-program/VISION.md`). Blocked on Kane answering the five blocking questions in
+  `assessment-program/QUESTIONS.md`; the vision then goes to Sol per its own header before an
+  implementation plan exists.
