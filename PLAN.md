@@ -1,0 +1,271 @@
+# Conductor build plan
+
+Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says what we are building
+and why. This file says what is done, what is next, and what we agreed. Update it in the same
+commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
+
+Status: **M0 in progress. S1 green, S2 amber, S3 green (addendum in flight), S4 green. S5
+running.** Last updated 2026-08-01.
+
+## How to read this file
+
+- `[ ]` not started, `[~]` in progress, `[x]` done and verified.
+- Nothing is `[x]` until the evidence line under it is filled in with real output. Build success is
+  not evidence. "It should work" is not evidence.
+- Each milestone has a **finish line**. The milestone is done when the finish line is demonstrated
+  end to end, not when the last task is ticked.
+
+## Ratified decisions
+
+Agreed with Kane on 2026-08-01. These are settled. Changing one means changing this list and
+saying why.
+
+| # | Decision | Choice |
+|---|---|---|
+| D1 | Scope of this run | M0 spikes, then M1 engine. Stop and report if a spike comes back red. |
+| D2 | Progress tracking | This file, committed. Spike verdicts in `docs/spikes/`. |
+| D3 | Autonomy | Branch and commit freely. Merge to main after Sol review plus demonstrated run. Install packages as needed. Start real SDK sessions that spend Kane's usage. Deep research allowed. |
+| D4 | Verification | Run it and paste the output. No test framework in v1. |
+| D5 | State location | `%USERPROFILE%\.conductor\`, outside the repo, path configurable. Never committed. |
+| D6 | Transport | One HTTP plus WebSocket server bound to 127.0.0.1. Tailscale address added at M5. |
+| D7 | First real job | Conductor drives work in `C:\Users\KaneSnyder(nexwave)\repos\nexwave-apps`. |
+| D8 | Red spike 1 | Stop and tell Kane. Do not build against a mock. Do not silently switch to an API key. |
+| D9 | Approvals | Per-task trust level, set when the task is queued. Destructive actions always stop for a tap regardless of trust level. |
+| D10 | Accounts | Three live buckets: `.claude-work`, `.claude-personal`, `.claude-third` (real folder name sanitised for the public repo; Kane knows it). Separate config directories already. `.claude` (default) is not a Conductor bucket. |
+| D11 | Account switcher | Kane's own extension. Source at `C:\Users\KaneSnyder(nexwave)\Documents\Account Switch Extension`. Rough and buggy. Conductor absorbs the working mechanism and replaces the extension if it does the job better. |
+| D12 | Pace | Steady, quality first. Spikes properly verified. Sol reviews every milestone. |
+
+## Ground truth about this machine
+
+Checked 2026-08-01. Re-check if anything stops behaving.
+
+- Node v24.11.1, npm 11.6.2.
+- Claude Code 2.1.220. codex-cli 0.144.0. Tailscale 1.94.2.
+- `ANTHROPIC_API_KEY` is unset. It stays unset. This is golden rule 1.
+- Claude config dirs present: `.claude`, `.claude-work`, `.claude-personal`, `.claude-third`,
+  plus non-account folders `.claude-monitor`, `.claude-server-commander`, `.claude-work` project
+  state under `.claude-work`.
+- `~/.claude-monitor/` exists with `cache/`, `logs/`, `reports/`, `last_used.json`. Likely lead for
+  spike 2, the official usage percentages question. Read it before writing any usage code.
+- Account switcher installed as a VSIX at
+  `~/.vscode/extensions/resonancelattice-semanticus.claude-workspace-account-manager-0.2.0-win32-x64`.
+  Source is at the Documents path in D11.
+- Target project for the first real job: `~/repos/nexwave-apps`.
+
+## Stop conditions
+
+Stop working, write down what happened, and tell Kane. Do not push through any of these.
+
+1. Any spike verdict comes back red. Especially spike 1.
+2. Anything appears to require `ANTHROPIC_API_KEY`, a token, or any credential in the repo.
+3. Usage data, logs, handoffs, or account identifiers are about to land in a committed file.
+4. Work drifts past the M1 finish line. M2 does not start in this run.
+5. A design choice contradicts the spec and the spec looks wrong. Say which is wrong, do not
+   quietly pick one.
+6. Sol raises a finding that changes the design rather than the code.
+
+## M0, spikes
+
+Five throwaway scripts, five written verdicts. Each verdict is a file in `docs/spikes/` with the
+question, what was run, the raw output, and a one-word verdict of green, amber, or red. Scripts
+live in `spikes/` and are deleted or left obviously throwaway. Nothing in M1 gets built on an
+unanswered spike.
+
+### S1, subscription auth through the SDK
+
+Highest value. Blocks everything.
+
+- [x] Hello-world Agent SDK session runs with `ANTHROPIC_API_KEY` unset, against one of the three
+      account config dirs.
+- [x] Confirm it draws on plan usage, not an API balance. Say how we know.
+- [x] Confirm `CLAUDE_CONFIG_DIR` targeting works, so two sessions can run on two accounts.
+- Verdict file: `docs/spikes/s1-subscription-auth.md`
+- Evidence: **Green.** `query()` answered "pong" on Haiku with `apiKeySource: none` and the key
+  asserted absent from the child env. Auth chain closed by a negative control: an empty config dir
+  fails with "Not logged in", so the plan OAuth credential in `CLAUDE_CONFIG_DIR` is the only thing
+  authenticating. Both `.claude-work` (team) and `.claude-personal` (max) ran and each run touched
+  its own dir's `.claude.json`. Two carries: a cold `query()` costs ~26k cache-creation tokens
+  (session startup is the unit of spend, pacing must know this), and two-account concurrency is
+  untested (open question, M4). Addendum answered: an SDK session does not refresh
+  `cachedUsageUtilization`; `fetchedAtMs` never moved on either account. That downgraded S2 to
+  amber.
+
+### S2, official limit percentages outside the official UI
+
+- [x] Read `~/.claude-monitor/` and work out where its numbers come from.
+- [x] Read the account switcher source at the D11 path and work out what it reads for cross-account
+      usage.
+- [x] Check Claude Code's own state files and status line JSON for a readable limit percentage.
+- [x] Pick a source. Self-metering is the floor and ships regardless. Anything better is a bonus
+      that must be calibrated once against an official number.
+- Verdict file: `docs/spikes/s2-usage-source.md`
+- Evidence: **Amber** (green until S1's refresh test). Official percentages live in
+  `<configDir>\.claude.json` under
+  `cachedUsageUtilization`: 5-hour and weekly utilization 0 to 100, reset times, per-model weekly
+  in `limits[]` `weekly_scoped`, credit pool in `extra_usage`. Plain file read per account, no
+  credentials. Kane's switcher reads exactly this and nothing else. Freshness is `fetchedAtMs`,
+  never file mtime (observed two days stale on an active account). `.claude-monitor` is a dead
+  end. Gauge design: official reading as anchor plus self-metered delta, gap logged to
+  `events.jsonl` as a calibration event; readings over ~90 minutes old are estimated-only; absent
+  or unparseable block means no reading, never zero; the parse never throws. Downgraded to amber
+  because S1 proved SDK sessions never refresh the block, so for a Conductor-driven account the
+  official reading has unbounded staleness. Emphasis flips: self-metering is the primary number,
+  the official reading is a calibration anchor applied whenever a fresh one appears.
+
+### S3, `/compact` behaviour through the SDK
+
+- [x] Send `/compact` with focus instructions on a resumed session. Confirm the focus is honoured.
+- [x] Confirm the compact boundary is visible to the host program.
+- [x] If flaky, verdict is amber and M1 ships fresh cut only, which is the preferred mode anyway.
+- Verdict file: `docs/spikes/s3-compact.md`
+- Evidence: **Green.** `/compact` sends as a plain prompt in a streaming session; focus
+  instructions reach the summarizer (seen verbatim in the PreCompact hook) and steer recall: after
+  compacting with "preserve only the codename", the model recalled the codename and reported the
+  other two planted facts unknown. Boundary visible four ways: status messages, PreCompact,
+  PostCompact (carries the summary), and `compact_boundary` with pre/post token counts and
+  `trigger: manual` vs auto. Caveats: focus steers but does not redact (dropped facts were still
+  quoted inside the summary text), the summary confabulated a sentence, and the compact turn
+  reports zero usage so the gauge must estimate compaction cost from `pre_tokens`. All three
+  caveats argue for fresh cut as default, which the spec already chose. Bonus find: the stream
+  carries a `rate_limit_event` message with fresh official limit data; characterization addendum
+  in flight.
+
+### S4, usage buckets
+
+- [x] Confirm which bucket SDK usage currently lands in, given Anthropic paused the billing split
+      on 2026-06-15.
+- [x] Confirm the gauge design holds if a separate SDK credit ships later. Buckets are plural from
+      day one.
+- Verdict file: `docs/spikes/s4-buckets.md`
+- Evidence: **Green.** SDK usage draws from ordinary plan limits today; Anthropic's help article
+  (updated 2026-06-16) says so plainly and no later announcement changes it. Bucket model per
+  account: `session_5h`, `weekly_all`, `weekly_scoped` (one per model, discovered not hardcoded),
+  `extra_usage_credit` when enabled, and `sdk_credit` as a discovery-based placeholder. Hazard
+  found: the work account has extra-usage credits enabled, so overrunning the plan limit there
+  spends real money instead of stopping; pacing must treat that boundary as hard. Also:
+  `is_active` means binding-now, not populated or highest; and `.claude.json` can hold duplicate
+  keys differing by drive-letter case, so the gauge parser must tolerate them.
+
+### S5, Windows service ergonomics
+
+- [ ] Auto-start at login on Windows 11, without admin rights if possible.
+- [ ] Keep-awake while sessions run, and released when they stop.
+- [ ] Bind a server to the Tailscale interface only, and prove nothing else is listening.
+- Verdict file: `docs/spikes/s5-windows.md`
+- Evidence:
+
+**M0 finish line:** five verdict files exist, all green or amber with a written fallback. Kane
+reads the summary. If S1 is red, this run ends here per D8.
+
+## M1, engine
+
+Build only what the spec lists for M1: daemon, one SDK session, `finish_task`, fresh cut, gauge
+line with context fill plus self-metered usage, `events.jsonl`, minimal CLI door. No playbook
+enforcement, no pacing, no VS Code panel, no phone page. Those are M2 and later.
+
+### Scaffold
+
+- [ ] `package.json`, `tsconfig.json`, TypeScript, Node, terse modern style. Dependency list stays
+      short and each unusual one is justified here.
+- [ ] `src/` layout agreed and written down in this file before code lands.
+- [ ] `.gitignore` that makes it impossible to commit state, logs, or credentials.
+- Evidence:
+
+### State layer
+
+- [ ] Resolve `%USERPROFILE%\.conductor\` and create it on first run. Path overridable by env var.
+- [ ] `events.jsonl` append-only writer. One line per meaningful event, per the spec's Logbook
+      section.
+- [ ] `handoffs/` folder, one file per finished task.
+- [ ] `playbook.md` seeded with a starter page. M1 reads and injects it. M1 does not enforce it.
+- Evidence:
+
+### Session runner
+
+- [ ] Start one Agent SDK session against a chosen account config dir.
+- [ ] Stream turns out to whoever is connected.
+- [ ] Per-task trust level controls the permission mode, per D9. Destructive actions always stop.
+- Evidence:
+
+### The cut
+
+- [ ] `finish_task` in-process tool. Input: handoff note, outcome verdict, optional follow-up tasks.
+- [ ] Fresh cut. End the session, start the next task in a new one, feed back only the handoff note
+      and pointers.
+- [ ] Mid-task checkpoint works through the same tool, no second mechanism.
+- [ ] PreCompact hook logs every backstop auto-compact, because each firing means the loop failed.
+- Evidence:
+
+### Gauge
+
+- [ ] Context fill percentage from the SDK, per session.
+- [ ] Self-metered token usage summed from every SDK result message, per model, per account, per
+      rolling window.
+- [ ] Official percentage source if S2 found one. Otherwise self-metering only, clearly labelled.
+- [ ] One-line status injected into every turn. Calm wording. Includes the standing sentence that
+      there is ample room to finish the current step.
+- Evidence:
+
+### Doors
+
+- [ ] HTTP plus WebSocket server on 127.0.0.1 only.
+- [ ] CLI: start the daemon, show status and gauge, add a task, run a task, tail the log.
+- Evidence:
+
+### Review and land
+
+- [ ] Sol review, scoped tightly, one dimension per ask. Findings written to a file.
+- [ ] Findings resolved or explicitly parked with a reason.
+- [ ] Merge to main.
+- Evidence:
+
+**M1 finish line:** a real task runs end to end in `~/repos/nexwave-apps`. Claude works it, calls
+`finish_task`, the context is cut on purpose, the next task starts clean with the handoff note, the
+gauge line appears on every turn, and `events.jsonl` holds the full story. Raw terminal output
+pasted into this file.
+
+## Parked for later milestones
+
+Written down so they do not leak into M1.
+
+- M2: playbook enforcement and hard rails, task queue with pacing, subagent registry, compact cut.
+- M3: VS Code panel.
+- M4: account layer proper, switcher replacement, cross-account gauge.
+- M5: Tailscale phone page.
+- M6: scheduled review task that edits the playbook with evidence.
+- M7: external runners, headless Codex first, cross-vendor gauge buckets.
+
+## Open questions
+
+Things not settled. Add to this list rather than guessing.
+
+- Do two simultaneous SDK sessions on two different `CLAUDE_CONFIG_DIR` values interfere? S1 only
+  ran them sequentially. Must be answered before M4, ideally as a two-minute test during M1.
+- Answered 2026-08-01: the SDK stream DOES surface limit data in-band, as a `rate_limit_event`
+  message (found by S3). Exact shape, fire conditions, and weekly coverage are being characterized
+  in the S3 addendum. If it carries percentages, it becomes the gauge's fresh source for whichever
+  account is running a session, with the file read for idle accounts and self-metering as floor.
+- The two accounts have different bucket shapes: work has usage credits enabled with a monthly
+  limit, personal has them disabled. The cross-account gauge cannot assume one layout.
+
+## Decisions log
+
+Append here when a design call is made during the build. Date, decision, reason, one line each.
+
+- 2026-08-01. Plan created from SPEC.md revision 2 after a decision round with Kane. See the
+  ratified decisions table.
+- 2026-08-01. Gauge emphasis flipped: self-metering primary, official `cachedUsageUtilization`
+  reading as calibration anchor only. Reason: S1 proved SDK sessions never refresh the block.
+- 2026-08-01. Pacing must treat session startup as a unit of spend, not just conversation. Reason:
+  S1 measured ~26k cache-creation tokens for a cold 10-token `query()`. Session reuse and cut
+  cadence are cost levers, and a fresh cut is not free.
+- 2026-08-01. Publishing scrub rule for this repo, which is public: committed docs never carry
+  exact personal utilization percentages (characterise as low, mid, high, or withheld) and never
+  name the third account folder; it is `.claude-third` in all committed text. Timestamps, token
+  counts, and field names are fine. Ratified by Kane before first push.
+- 2026-08-01. Extra-usage credits are a hard pacing rail, not a soft one. Reason: S4 found the
+  work account overruns into paid credits instead of stopping. The playbook's hard rails must
+  include never crossing from plan usage into paid credits without a human tap.
+- 2026-08-01. Fresh cut confirmed as default cut mode with evidence, not just preference. Reason:
+  S3 showed compact focus steers but does not redact, summaries can confabulate, and compaction
+  cost is invisible to usage reporting.
