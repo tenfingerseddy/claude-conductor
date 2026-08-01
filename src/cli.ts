@@ -23,8 +23,10 @@ const USAGE = `conductor <command>
   undo [taskId] [--yes]        put the task's folder back to its before-image
                                without --yes it only shows what it would change
        [--override-changed-after-task]
-                               also touch files changed after the task finished, which undo
-                               otherwise leaves alone and lists by name
+                               also touch the paths undo is holding back, which it otherwise
+                               leaves alone and lists by name. Those are files changed after
+                               the task finished, or, when the task left no post-image, every
+                               difference, because provenance is then unknown
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
