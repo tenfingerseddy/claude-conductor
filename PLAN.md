@@ -361,6 +361,58 @@ Written down so they do not leak into M1.
 - M6: scheduled review task that edits the playbook with evidence.
 - M7: external runners, headless Codex first, cross-vendor gauge buckets.
 
+## Overnight run, 2026-08-01
+
+Kane asleep, working autonomously. Assumptions stated here so they can be overturned in the
+morning rather than discovered. This is the assumption register pattern from SPEC revision 4,
+used on its first real night.
+
+**Pacing, and why it shapes the plan.** Gauge read at the start of the run: work account 77% of
+its 5-hour window on a 34-minute-old reading, weekly 53%. That account has extra-usage credits
+enabled, so overrunning spends real money, and the playbook's hard rail says never cross that
+line without a human tap. Kane cannot tap. So the night is paced deliberately: sequential
+builders, no fan-out, heavy work held until after a window reset, and the cheap architect work
+done in the main thread meanwhile. Sol reviews are free in Claude terms because Codex is a
+different vendor, so review is the one thing that can run freely.
+
+**Order of work:**
+
+1. Finish the rail simplification (running), verify every one of Sol's nine bypasses taps.
+2. One Sol pass on the simplified rail. Cheap to review because it is mostly a deletion.
+3. If clean, merge `feat/m1-engine` to main and close M1.
+4. Write the M2 plan properly in the main thread: slices, briefs, finish lines. Costs almost
+   nothing and is the highest-value thing I can do while pacing.
+5. Re-read the gauge. Only if the 5-hour window has reset, start one M2 foundation builder.
+
+**Assumptions, overturnable:**
+
+- A1. Merging M1 once the simplified rail passes Sol and the demo re-runs is within the autonomy
+  Kane granted. He approved merge-after-review-and-demonstrated-run explicitly.
+- A2. Overnight building is limited to work that cannot loosen safety: the durable task queue,
+  checkpoints, the notebook, the inbox. Nothing that widens permissions lands while he sleeps.
+- A3. The rail rebuild (argv-array execution, filesystem place enforcement) and the permissive
+  default are designed overnight but not built and not merged. They are the things that could
+  hurt him, so they wait for his ratification.
+- A4. Nothing in `nexwave-apps` is touched. The scope program is unblocked but it has its own
+  plan and starting it unbriefed overnight is not what autonomy means.
+- A5. The two decisions flagged for re-putting (D9 approvals, D5 state location) stay parked.
+  They need Kane's own words, and guessing them would be the exact provenance failure the spec
+  just warned about.
+- A6. If a build fails twice on the same problem, stop and write it up rather than trying a third
+  variation. Today's rail cost three rounds before the design changed; the lesson is cheap to
+  reuse.
+
+**Morning report** goes at the top of this file, above the status line.
+
+**Operational lesson, learned the hard way at 
+the start of the run.** Do not `git stash` or switch
+branches while a builder is working the same tree. Doing it once pulled a running builder's
+in-progress edits out from under it and left a conflicted index on main. Nothing was lost, the
+stash was retained and everything was restored, but it could have corrupted a build. New rule for
+the architect: while a builder is active, commit documentation on the working branch and let it
+reach main at merge time. Never switch branches to tidy up. This belongs in the notebook once the
+notebook exists, which is a fair argument for building it early.
+
 ## Open questions
 
 Things not settled. Add to this list rather than guessing.
