@@ -595,6 +595,10 @@ Only after A and B.
 - [ ] Playbook hard rails enforced by the service, not just advised.
 - [ ] Subagent registry with per-profile model, effort, and account routing, plus the honesty line
       about legitimate account use in the playbook.
+- [ ] `model_change` logbook event. The harness can switch the model mid-run without asking, as it
+      did twice on 2026-08-01 via refusal fallback. A harness that silently changes the model is
+      exactly what the logbook exists to catch, and per-model spend in the gauge depends on
+      knowing which model actually ran.
 - Finish line: a rail in the playbook demonstrably stops the service, not just the model.
 
 ## Parked for later milestones
@@ -607,6 +611,42 @@ Written down so they do not leak into M1.
 - M5: Tailscale phone page.
 - M6: scheduled review task that edits the playbook with evidence.
 - M7: external runners, headless Codex first, cross-vendor gauge buckets.
+
+## The model switch, investigated 2026-08-02
+
+Kane noticed the session had switched to Opus and asked whether a compact or reset caused it.
+Answer: neither. It was a **safety-classifier false positive on our own security work**, twice.
+
+Evidence, from this session's transcript
+(`~/.claude-work/projects/c--Users-KaneSnyder-nexwave--repos-conductor/9a8ad5b6-....jsonl`):
+
+- **Zero compaction events in the entire transcript.** No `isCompactSummary`, no
+  `compact_boundary`, no auto-compact. The context was never summarised, so that theory is out.
+- Two events of type `model_refusal_fallback`, both `trigger: refusal`, both
+  `apiRefusalCategory: "cyber"`, both `claude-fable-5 -> claude-opus-5`. At 10:44:39Z and at
+  19:03:18Z. The harness text: "Fable 5's safeguards flagged this message ... can sometimes flag
+  legitimate coding, cybersecurity, and biology tasks. Switched to Opus 5."
+- The timing is the tell. The first fired on the turn reporting Sol's rail failure, in a
+  conversation full of `cmd /c del`, `node -e`, interpreter-wrapper bypasses and quoting attacks.
+  The second fired during the later security work. We were hardening a permission rail against
+  command injection, and the classifier read that as offensive cyber content.
+
+**Consequence worth knowing:** this is likely to recur, because the work itself is the trigger. M2
+slice B is the rail rebuild, which means more of exactly this material. If the session is set back
+to Fable it may fall back to Opus again mid-run, without asking.
+
+**A second finding fell out of the same investigation: commit authorship in this repo is
+unreliable.** The `Co-Authored-By` trailer tracks the *configured* model, not the model that
+actually produced the work. So main-thread commits during a fallback are signed Fable while Opus
+wrote them, and every builder commit is signed Fable although `builder.md` pins builders to Opus.
+Both directions are wrong. Given SPEC revision 4 just adopted provenance grading as a design
+principle, our own commit metadata failing the same test is worth naming rather than shrugging at.
+Not rewriting history over it; from here the trailer states the configured model and the body says
+who did the work when it matters.
+
+**For Conductor's own design:** the harness changed the model mid-run and told nobody but the
+transcript. That is precisely a `model_change` event the logbook should carry, and it strengthens
+the case for the gauge tracking per-model spend. Booked into M2 slice F.
 
 ## Overnight run, 2026-08-01
 
