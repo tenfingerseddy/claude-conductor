@@ -350,6 +350,78 @@ files; no git ran there. Full transcripts and events trail:
 `docs/notes/m1-finishline-findings.md`. Four wrinkles captured, not patched, listed under open
 questions; they go to the Sol review and one fix slice.
 
+## M2, brain
+
+Written 2026-08-01 during the overnight run, before any M2 code. Order matters here: each slice
+below is a prerequisite of the permissive default, which is the milestone's actual goal. M1 ships
+tap-heavy and unattended-incapable; M2 is what earns the freedom back honestly.
+
+### Slice A, checkpoints and undo (the enabler)
+
+Nothing else in M2 is safe without this, so it goes first.
+
+- [ ] Before each task in a git project, commit the working tree to a Conductor branch. Never to
+      the user's branch, never a push.
+- [ ] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
+- [ ] `undo last task` on every door: restore the tree to the task's checkpoint ref.
+- [ ] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
+      refusal beats a checkpoint that does not exist.
+- Finish line: a task makes a mess, one command puts it back exactly, proven on a scratch repo
+  with a dirty tree beforehand.
+
+### Slice B, place enforcement and shell-free execution (the rail rebuild)
+
+The thing three review rounds proved cannot be done by reading strings.
+
+- [ ] Run commands as argument vectors with no shell, so nothing transforms the vector after the
+      rail inspects it. This dissolves the bug class rather than patching it.
+- [ ] Enforce place at the filesystem: resolve real paths and compare against the allowlist, after
+      symlink resolution, rather than inspecting command text.
+- [ ] Only then, re-introduce a vouched-safe set, argv-shaped and small, with the interpreter rule
+      from the decisions log still binding.
+- [ ] Sol reviews this before it lands, with the standing brief that three previous versions failed.
+- Finish line: every one of Sol's nine bypasses is inexpressible rather than merely blocked, and
+  ordinary reads run without taps.
+
+### Slice C, the permissive default
+
+Only after A and B.
+
+- [ ] Reversible work runs without asking and is reported afterwards.
+- [ ] The irreversible set from SPEC's security section always stops: writing outside allowlisted
+      folders, deleting what version control never saw, pushing to a remote, sending anything
+      outward, crossing into paid credits.
+- [ ] Autonomous trust is re-enabled at the gate, gated on A and B being present.
+- Finish line: an unattended queue runs a real chain overnight, and the morning shows what it did
+  with an undo available for every step.
+
+### Slice D, the queue with pacing
+
+- [ ] Durable ordered queue on disk, surviving a daemon restart (closes the two parked Sol
+      findings about handoff recovery and follow-up queueing).
+- [ ] `finish_task` follow-ups land in it automatically.
+- [ ] Scheduling reads the gauge and the playbook: heavy work waits for resets, light work fills
+      remaining headroom, and the paid-credit boundary is a hard stop.
+- Finish line: a queue with a heavy task and a light one paces correctly against a real window.
+
+### Slice E, the inbox
+
+- [ ] `inbox/` accepts dropped files, raw kept verbatim, order by timestamp.
+- [ ] Triage at cut points into typed items: intent, answer, reversal, constraint, notebook fact,
+      noise.
+- [ ] Reversals are stated loudly and mark superseded work rather than deleting it.
+- [ ] Provenance grading recorded per item, per SPEC revision 4.
+- Finish line: two dumps, the second contradicting the first, produce a stated reversal and a
+  superseded task rather than a silent edit.
+
+### Slice F, notebook, playbook enforcement, subagent registry
+
+- [ ] `notebook.md` written by Claude, pruned by the review loop, page-capped.
+- [ ] Playbook hard rails enforced by the service, not just advised.
+- [ ] Subagent registry with per-profile model, effort, and account routing, plus the honesty line
+      about legitimate account use in the playbook.
+- Finish line: a rail in the playbook demonstrably stops the service, not just the model.
+
 ## Parked for later milestones
 
 Written down so they do not leak into M1.
