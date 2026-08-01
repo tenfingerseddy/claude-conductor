@@ -235,29 +235,46 @@ src/
 
 ### Session runner
 
-- [ ] Start one Agent SDK session against a chosen account config dir.
-- [ ] Stream turns out to whoever is connected.
-- [ ] Per-task trust level controls the permission mode, per D9. Destructive actions always stop.
-- Evidence:
+- [x] Start one Agent SDK session against a chosen account config dir.
+- [x] Stream turns out to whoever is connected.
+- [~] Per-task trust level controls the permission mode, per D9. Destructive actions always stop.
+- Evidence: Slice 2, commit `b721536` on `feat/m1-engine`. Sessions run per task with
+  `CLAUDE_CONFIG_DIR` from the account registry and the API key stripped from the child env.
+  Trust maps attended to default permissions and autonomous to acceptEdits scoped to the task
+  cwd, never bypassPermissions. Messages stream to a callback for the doors. The destructive rail
+  is enforced in `canUseTool`, which the SDK warns can be shadowed by allow-rules in the user's
+  own settings files: strong against the model, weak against settings. Slice 3 moves it to a
+  `PreToolUse` hook; the box stays `[~]` until then.
 
 ### The cut
 
-- [ ] `finish_task` in-process tool. Input: handoff note, outcome verdict, optional follow-up tasks.
-- [ ] Fresh cut. End the session, start the next task in a new one, feed back only the handoff note
+- [x] `finish_task` in-process tool. Input: handoff note, outcome verdict, optional follow-up tasks.
+- [x] Fresh cut. End the session, start the next task in a new one, feed back only the handoff note
       and pointers.
-- [ ] Mid-task checkpoint works through the same tool, no second mechanism.
-- [ ] PreCompact hook logs every backstop auto-compact, because each firing means the loop failed.
-- Evidence:
+- [~] Mid-task checkpoint works through the same tool, no second mechanism.
+- [x] PreCompact hook logs every backstop auto-compact, because each firing means the loop failed.
+- Evidence: Slice 2. A two-task Haiku chain ran end to end: task 1 called `finish_task` with a
+  real handoff and one follow-up, the cut fired (`finish_task` returning does not end a session,
+  so the tool schedules `query.interrupt()`), task 2 started in a new session and quoted the
+  handoff it received. The tool loads with `alwaysLoad` so no turn is wasted finding it.
+  Checkpoint is `[~]`: the mechanism is the same tool as specced, but the trigger signal has a
+  gap, see the open question on mid-task gauge refresh.
 
 ### Gauge
 
-- [ ] Context fill percentage from the SDK, per session.
-- [ ] Self-metered token usage summed from every SDK result message, per model, per account, per
+- [x] Context fill percentage from the SDK, per session.
+- [x] Self-metered token usage summed from every SDK result message, per model, per account, per
       rolling window.
-- [ ] Official percentage source if S2 found one. Otherwise self-metering only, clearly labelled.
-- [ ] One-line status injected into every turn. Calm wording. Includes the standing sentence that
+- [x] Official percentage source if S2 found one. Otherwise self-metering only, clearly labelled.
+- [~] One-line status injected into every turn. Calm wording. Includes the standing sentence that
       there is ample room to finish the current step.
-- Evidence:
+- Evidence: Slice 2. Four-layer stack live: the experimental usage probe returned real
+  `official_live` readings with reset times during the chain run, `rate_limit_event` is logged as
+  `limit_event`, the file read is gated on `fetchedAtMs`, self-metering always on, and a
+  calibration event fired comparing prediction to official. Injection is the documented
+  `UserPromptSubmit` hook (`additionalContext`), which fires per user prompt; M1 sends one prompt
+  per task, so the line lands at task top and does not refresh mid-task. Box stays `[~]`; see the
+  open question.
 
 ### Doors
 
@@ -305,6 +322,12 @@ Things not settled. Add to this list rather than guessing.
   limit, personal has them disabled. The cross-account gauge cannot assume one layout.
 - Tailscale is installed but in NoState with no IP on this machine. The live Tailscale bind check
   from S5 re-runs once Kane logs Tailscale in. Blocks M5 only.
+- Mid-task gauge refresh. The spec says the gauge line is injected every turn; the documented
+  injection point fires per user prompt, and the one-task-one-prompt loop means once per task.
+  So the mid-task checkpoint currently has no live trigger between prompts. Candidate fixes for
+  M2, in preference order: a PostToolUse-style hook if it can carry additionalContext, or the
+  service watching gauge state and calling `interrupt()` plus a checkpoint instruction when a
+  threshold trips. Spec wording may need a revision 3 touch here; flag for Sol.
 
 ## Decisions log
 
@@ -332,3 +355,6 @@ Append here when a design call is made during the build. Date, decision, reason,
   pressure interrupt; (3) `.claude.json` file read for idle accounts, gated on `fetchedAtMs`;
   (4) self-metering always on as the floor and calibration substrate. Every layer degrades to the
   next without erroring.
+- 2026-08-01. `zod` accepted as the second runtime dependency. Reason: the SDK's `tool()` takes a
+  zod schema and ships zod only as a peer dependency; declaring it beats silently relying on
+  hoisting. Runtime deps are now exactly two: the SDK and zod.
