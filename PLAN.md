@@ -478,8 +478,28 @@ Nothing else in M2 is safe without this, so it goes first.
   accepted in writing by Kane: ignored files are outside the safety net, and a file whose bytes
   disagree with its own `.gitattributes` comes back converted rather than identical. A safety net
   with unstated holes is worse than a visible tap.
-- Pending: Sol review before this merges. Checkpoints are the foundation the permissive default
-  rests on, so they get the same adversarial treatment the rail got.
+- **Sol review: not safe to merge.** Fifteen findings, three critical, eight high, four medium.
+  `docs/notes/sol-review-m2-sliceA.md`. Sol's verdict in its own words: slice A does not yet
+  justify the permissive permission default. Its diagnosis is the right one and worth keeping:
+  the before-image is sound, but the plan built from it guesses provenance, and the preview
+  asserts that guess as fact.
+  Four blocking: (1) undo compares checkpoint against now, so it cannot tell task output from work
+  a human did afterwards, and would overwrite the human's later edit while labelling it task
+  output; (2) confirmation is not bound to the preview, since the server recomputes the plan on
+  the confirming call and accepts a confirm with no preview at all, so consent is to a list that
+  is not the list that runs; (3) a case-only rename deletes the file undo just restored, because
+  restores run before deletes and Windows treats both spellings as one file; (4) a changed
+  `.gitignore` lets undo delete a previously ignored file, breaking a promise the stated limits
+  make. Five more are real limits rather than bugs (index and HEAD state, `.gitattributes` silent
+  non-detection, submodules, symlink referents, the non-atomic scan) and the limits list reads as
+  exhaustive at two entries when it is not. One false positive.
+  Fix round in flight. Design direction given: a post-image snapshot at task finish makes
+  provenance knowable instead of inferred, so undo touches only the diff from checkpoint to
+  post-image and never silently overwrites anything changed since.
+- Notebook fact from this review: the codex read-only sandbox cannot launch a process on this
+  host, so Sol's first run read nothing and correctly refused to review rather than invent
+  findings. The workaround is to inline the files, line-numbered, in the brief. Worth knowing
+  before every future Sol pass.
 
 ### Slice B, place enforcement and shell-free execution (the rail rebuild)
 
