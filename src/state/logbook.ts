@@ -91,10 +91,15 @@ export type ConductorEvent =
       /** The task cwd relative to the repo root, '/'-separated. Empty when it is the root. */
       relPath: string;
       workdir: string;
-      /** What the copy lacks, counted in the user's folder at creation time. */
-      modifiedTracked: number;
-      untracked: number;
+      /**
+       * What the copy lacks, counted in the user's folder at creation time. Null when the count
+       * could not be taken: a failed `git status` must never be logged as a clean folder.
+       */
+      modifiedTracked: number | null;
+      untracked: number | null;
       workdirCreated: boolean;
+      /** True when the user's HEAD moved between reading it and the copy existing. */
+      headMovedDuringCreate: boolean;
     }
   // No copy was made, so no task ran. Logged as loudly as a creation: there is no fallback to
   // running in the user's folder, so this line is the whole story of why nothing happened.
@@ -103,7 +108,9 @@ export type ConductorEvent =
   | { kind: 'workspace_sealed'; taskId: string; branch: string; commit: string; committed: boolean; files: number }
   | { kind: 'workspace_seal_failed'; taskId: string; branch: string; reason: string }
   // Undo. ok:false means the copy is still on disk and the branch was left alone.
-  | { kind: 'workspace_discarded'; taskId: string; branch: string; worktreePath: string; ok: boolean; reason?: string }
+  // `note` records something deliberately left alone, such as a branch of the right name that git's
+  // metadata could not confirm was Conductor's.
+  | { kind: 'workspace_discarded'; taskId: string; branch: string; worktreePath: string; ok: boolean; reason?: string; note?: string }
   | {
       kind: 'gauge_reading';
       account: string;

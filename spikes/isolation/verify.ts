@@ -6,8 +6,8 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const ROOT = join(tmpdir(), 'cond-iso');
@@ -63,6 +63,38 @@ function same(label: string, a: Measure, b: Measure): void {
   check(`${label}: .git/index hash identical`, a.index === b.index, `${a.index} -> ${b.index}`);
   check(`${label}: HEAD unmoved`, a.head === b.head, `${a.head} -> ${b.head}`);
   check(`${label}: HEAD reflog identical`, a.reflog === b.reflog, `${a.reflog} -> ${b.reflog}`);
+}
+
+/** A throwaway repository with one commit. Returns that commit. */
+function newRepo(dir: string, files: Record<string, string> = { 'a.txt': 'one\n' }): string {
+  mkdirSync(dir, { recursive: true });
+  sh(dir, ['init', '-q', '-b', 'main']);
+  sh(dir, ['config', 'user.name', 'Scratch User']);
+  sh(dir, ['config', 'user.email', 'scratch@localhost']);
+  for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
+  sh(dir, ['add', '-A']);
+  sh(dir, ['commit', '-q', '-m', 'first commit']);
+  return sh(dir, ['rev-parse', 'HEAD']).trim();
+}
+
+/**
+ * git prints worktree paths with forward slashes, and as the true long name. %TEMP% here is the 8.3
+ * short name ("KANESN~1"), so a raw string compare against git's output silently never matches. Same
+ * trap the module's realPath comment describes, met again in the harness.
+ */
+function slash(path: string): string {
+  let full = path;
+  try {
+    full = realpathSync.native(path);
+  } catch {
+    // Not on disk any more (a deliberately deleted worktree): resolve the parent instead.
+    try {
+      full = join(realpathSync.native(dirname(path)), basename(path));
+    } catch {
+      full = path;
+    }
+  }
+  return full.replace(/\\/g, '/');
 }
 
 // --- scratch world ------------------------------------------------------------
@@ -283,6 +315,283 @@ if (made3.ok) {
   const good = iso.discardWorkspace(config, 't3');
   check('discard works once it adds up again', good.ok === true, good.ok ? '' : good.reason);
   sh(REPO, ['branch', '-D', 'someone-elses']);
+}
+
+// ================================================================================
+// Sol's M2 isolation review, one reproduction per accepted finding. Each of these fails against
+// commit a6effd6 and passes against the fix. The theme of 1 to 4 is one mistake: a name or a path
+// is not proof of ownership.
+// ================================================================================
+
+// --- 7. finding 1: sealing onto a branch the session switched to ---------------------
+
+say('\n=== 7. finding 1: seal must refuse when the copy is not on our branch ===');
+{
+  const R = join(ROOT, 'f1');
+  const base1 = newRepo(R);
+  const made = iso.createWorkspace(config, { id: 'f1', cwd: R });
+  check('f1 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    sh(R, ['branch', 'release', base1]);
+    sh(w.worktreePath, ['switch', '-q', 'release']);
+    writeFileSync(join(w.worktreePath, 'task-work.txt'), 'task output\n');
+    const s = iso.sealWorkspace(config, w);
+    say(`  seal said: ${s.ok ? 'SEALED ANYWAY' : s.reason}`);
+    check('seal refuses when the copy is on another branch', s.ok === false);
+    check('the refusal names what is actually checked out', s.ok === false && s.reason.includes('refs/heads/release'));
+    check('the user branch "release" was not advanced', sh(R, ['rev-parse', 'release']).trim() === base1, sh(R, ['rev-parse', 'release']).trim());
+    check('the task work is still in the copy', existsSync(join(w.worktreePath, 'task-work.txt')));
+    check('nothing was staged in the copy', sh(w.worktreePath, ['status', '--porcelain']).includes('?? task-work.txt'));
+
+    sh(w.worktreePath, ['checkout', '-q', '--detach']);
+    const s2 = iso.sealWorkspace(config, w);
+    say(`  detached seal said: ${s2.ok ? 'SEALED ANYWAY' : s2.reason}`);
+    check('seal refuses on a detached HEAD in the copy', s2.ok === false);
+    check('our task branch is still at the base commit', sh(R, ['rev-parse', w.branch]).trim() === base1);
+  }
+}
+
+// --- 8. finding 2: failed-add cleanup must not delete a branch that is not ours -------
+
+say('\n=== 8. finding 2: failed-add cleanup only deletes a branch still at the base commit ===');
+{
+  const R = join(ROOT, 'f2');
+  const base2 = newRepo(R, { 'ok.txt': 'fine\n', '.gitattributes': '*.txt filter=boom\n' });
+  // A commit nobody else references. If cleanup deletes the branch, this work is gone.
+  sh(R, ['checkout', '-q', '-b', 'temp']);
+  writeFileSync(join(R, 'ok.txt'), 'unique human work\n');
+  sh(R, ['commit', '-q', '-am', 'unique human work']);
+  const unique = sh(R, ['rev-parse', 'HEAD']).trim();
+  sh(R, ['checkout', '-q', 'main']);
+  sh(R, ['branch', '-D', 'temp']);
+
+  // A stray worktree whose folder is gone: unscoped `git worktree prune` would deregister it.
+  const stray2 = join(ROOT, 'stray-add');
+  sh(R, ['worktree', 'add', '--detach', '-q', stray2, base2]);
+  rmSync(stray2, { recursive: true, force: true });
+
+  // Deterministic stand-in for Sol's race. A required smudge filter runs inside `git worktree add`,
+  // points refs/heads/conductor/task-f2 at the unique commit, then fails the checkout. The state
+  // cleanup then sees is exactly Sol's: our add failed and a branch of that name exists whose tip is
+  // not the base commit. Only how it got there differs; cleanup cannot tell the difference anyway.
+  const boom = join(ROOT, 'boom.sh');
+  writeFileSync(
+    boom,
+    '#!/bin/sh\n' +
+      `mkdir -p "${slash(R)}/.git/refs/heads/conductor"\n` +
+      `printf '%s\\n' "${unique}" > "${slash(R)}/.git/refs/heads/conductor/task-f2"\n` +
+      'exit 1\n',
+  );
+  sh(R, ['config', 'filter.boom.smudge', `sh "${slash(boom)}"`]);
+  sh(R, ['config', 'filter.boom.required', 'true']);
+
+  const r = iso.createWorkspace(config, { id: 'f2', cwd: R });
+  say(`  create said: ${r.ok ? 'CREATED' : r.reason}`);
+  check('create refuses when worktree add fails', r.ok === false);
+  const tip = shSoft(R, ['rev-parse', '--verify', '--quiet', 'refs/heads/conductor/task-f2']).out.trim();
+  say(`  branch conductor/task-f2 tip after cleanup: ${tip || '(deleted)'}  unique=${unique}`);
+  check('the branch that is not at the base commit survives cleanup', tip === unique, tip || '(deleted)');
+  check('the refusal names the branch it left alone', r.ok === false && r.reason.includes('conductor/task-f2'));
+  const listed2 = sh(R, ['worktree', 'list', '--porcelain']);
+  check('an unrelated stray worktree is still registered after a failed add', listed2.includes(slash(stray2)), listed2.replace(/\n/g, ' | '));
+}
+
+// --- 9. finding 3: discard must not delete a branch that merely shares the name -------
+
+say('\n=== 9. finding 3: discard leaves a same-named branch it cannot account for ===');
+{
+  const R = join(ROOT, 'f3');
+  newRepo(R);
+  const made = iso.createWorkspace(config, { id: 'f3', cwd: R });
+  check('f3 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    // The worktree and the branch go away outside Conductor.
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    sh(R, ['branch', '-D', w.branch]);
+    // Later, a human makes an independent branch that happens to reuse the name.
+    writeFileSync(join(R, 'a.txt'), 'human work\n');
+    sh(R, ['commit', '-q', '-am', 'human work']);
+    const human = sh(R, ['rev-parse', 'HEAD']).trim();
+    sh(R, ['branch', w.branch, human]);
+
+    const d = iso.discardWorkspace(config, 'f3');
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (${d.note})` : ''}` : d.reason}`);
+    const still = shSoft(R, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]).out.trim();
+    check("the human's same-named branch survives discard", still === human, still || '(deleted)');
+    check('discard says it left that branch alone', d.ok === true && typeof d.note === 'string' && d.note.includes(w.branch), d.ok ? String(d.note) : d.reason);
+  }
+}
+
+// --- 10. finding 4: a detached worktree at our path is not ours -----------------------
+
+say('\n=== 10. finding 4: a detached worktree at the recorded path is not ours ===');
+{
+  const R = join(ROOT, 'f4');
+  const base4 = newRepo(R);
+  const made = iso.createWorkspace(config, { id: 'f4', cwd: R });
+  check('f4 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    sh(R, ['worktree', 'add', '--detach', '-q', w.worktreePath, base4]);
+    const humanFile = join(w.worktreePath, 'human-uncommitted.txt');
+    writeFileSync(humanFile, 'not committed anywhere\n');
+
+    const d = iso.discardWorkspace(config, 'f4');
+    say(`  discard said: ${d.ok ? 'DISCARDED ANYWAY' : d.reason}`);
+    check('discard refuses a detached worktree at our path', d.ok === false);
+    check('the refusal says a detached HEAD is there', d.ok === false && /detached/i.test(d.reason), d.ok ? '' : d.reason);
+    check("the human's uncommitted file was not destroyed", existsSync(humanFile));
+    check('the replacement worktree is still registered', sh(R, ['worktree', 'list', '--porcelain']).includes(slash(w.worktreePath)));
+    check('the branch was left alone', shSoft(R, ['show-ref', '--verify', '--quiet', `refs/heads/${w.branch}`]).code === 0);
+  }
+}
+
+// --- 11. finding 5: a read that writes ------------------------------------------------
+
+say('\n=== 11. finding 5: createWorkspace must not rewrite the primary .git/index ===');
+{
+  const R = join(ROOT, 'f5');
+  newRepo(R, { 'a.txt': 'one\n', 'b.txt': 'two\n' });
+  const indexPath = join(R, '.git', 'index');
+  sh(R, ['status', '--porcelain']); // settle the stat data
+  sh(R, ['status', '--porcelain']);
+  const settled = sha(readFileSync(indexPath));
+  // Touched, not changed: same bytes, new mtime. This is what makes git want to refresh the index.
+  const later = new Date(Date.now() + 4000);
+  utimesSync(join(R, 'a.txt'), later, later);
+  const beforeIndex = sha(readFileSync(indexPath));
+  check('touching a file does not itself rewrite the index', settled === beforeIndex, `${settled} -> ${beforeIndex}`);
+  const made = iso.createWorkspace(config, { id: 'f5', cwd: R });
+  const afterIndex = sha(readFileSync(indexPath));
+  say(`  .git/index ${beforeIndex} -> ${afterIndex}`);
+  check('f5 create ok', made.ok === true, made.ok ? '' : made.reason);
+  check('the primary .git/index is byte-identical across create', beforeIndex === afterIndex, `${beforeIndex} -> ${afterIndex}`);
+  if (made.ok) {
+    const d = iso.discardWorkspace(config, 'f5');
+    check('f5 discard ok', d.ok === true, d.ok ? '' : d.reason);
+    check('the primary .git/index is byte-identical across discard too', sha(readFileSync(indexPath)) === beforeIndex);
+  }
+}
+
+// --- 12. finding 7: unscoped `git worktree prune` is not ours to run -------------------
+
+say('\n=== 12. finding 7: discard must not prune unrelated worktree metadata ===');
+{
+  const R = join(ROOT, 'f7');
+  const base7 = newRepo(R);
+  const stray = join(ROOT, 'stray-worktree');
+  sh(R, ['worktree', 'add', '--detach', '-q', stray, base7]);
+  rmSync(stray, { recursive: true, force: true }); // the disconnected drive
+  check('the stray worktree is registered before we start', sh(R, ['worktree', 'list', '--porcelain']).includes(slash(stray)));
+  const made = iso.createWorkspace(config, { id: 'f7', cwd: R });
+  check('f7 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const d = iso.discardWorkspace(config, 'f7');
+    check('f7 discard ok', d.ok === true, d.ok ? '' : d.reason);
+    const listed = sh(R, ['worktree', 'list', '--porcelain']);
+    say(`  ${listed.replace(/\n/g, ' | ')}`);
+    check("the unrelated worktree's metadata survives discard", listed.includes(slash(stray)));
+    check('our own worktree is no longer registered', !listed.includes(slash(made.workspace.worktreePath)));
+  }
+}
+
+// --- 13. finding 8: zero is not the same as unknown ------------------------------------
+
+say('\n=== 13. finding 8: a failed status must not read as a clean folder ===');
+{
+  const R = join(ROOT, 'f8');
+  newRepo(R);
+  writeFileSync(join(R, '.git', 'index'), 'this is not a git index');
+  const statusFails = shSoft(R, ['status', '--porcelain']);
+  say(`  git status exit ${statusFails.code}: ${(statusFails.err || statusFails.out).trim().split('\n')[0]}`);
+  check('git status really does fail with a corrupt index', statusFails.code !== 0);
+  const made = iso.createWorkspace(config, { id: 'f8', cwd: R });
+  say(`  create said: ${made.ok ? 'ok' : made.reason}`);
+  if (made.ok) {
+    const w = made.workspace;
+    say(`  counts: modifiedTracked=${JSON.stringify(w.modifiedTracked)} untracked=${JSON.stringify(w.untracked)}`);
+    const text = iso.describeWorkspace(w);
+    say(text);
+    check('counts are null, not zero, when git status failed', w.modifiedTracked === null && w.untracked === null);
+    check('the description never claims the copy matches the folder', !text.includes('matches what you are looking at'));
+    check('the description says it could not tell', text.includes('could not tell'));
+  } else {
+    check('create still works when the primary index is corrupt', false, made.reason);
+  }
+}
+
+say('--- finding 8, the stated limit rather than a fix ---');
+{
+  const R = join(ROOT, 'f8b');
+  newRepo(R);
+  sh(R, ['update-index', '--assume-unchanged', 'a.txt']);
+  writeFileSync(join(R, 'a.txt'), 'changed behind git back\n');
+  say(`  git status with assume-unchanged: ${JSON.stringify(sh(R, ['status', '--porcelain']))}`);
+  const made = iso.createWorkspace(config, { id: 'f8b', cwd: R });
+  check('f8b create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const text = iso.describeWorkspace(made.workspace);
+    check('the description states the assume-unchanged limit out loud', text.includes('assume-unchanged'), text.split('\n').slice(6, 10).join(' | '));
+  }
+}
+
+// --- 14. finding 9: the label can be wrong even though the copy never is ---------------
+
+say('\n=== 14. finding 9: HEAD moving during creation is recorded ===');
+{
+  const R = join(ROOT, 'f9');
+  const base9 = newRepo(R);
+  sh(R, ['branch', 'other', base9]);
+  // The human switches branch while the copy is being made. A post-checkout hook is the only way to
+  // hit that window deterministically; it fires inside `git worktree add`, once.
+  const hook = join(R, '.git', 'hooks', 'post-checkout');
+  writeFileSync(
+    hook,
+    '#!/bin/sh\n' +
+      `test -f "${slash(ROOT)}/f9-fired" && exit 0\n` +
+      `: > "${slash(ROOT)}/f9-fired"\n` +
+      `git --git-dir="${slash(R)}/.git" symbolic-ref HEAD refs/heads/other\n`,
+  );
+  const made = iso.createWorkspace(config, { id: 'f9', cwd: R });
+  check('f9 create ok', made.ok === true, made.ok ? '' : made.reason);
+  say(`  the user's HEAD is now: ${shSoft(R, ['symbolic-ref', 'HEAD']).out.trim()}`);
+  if (made.ok) {
+    const w = made.workspace;
+    check('the hook really did move HEAD', shSoft(R, ['symbolic-ref', 'HEAD']).out.trim() === 'refs/heads/other');
+    check('the record says HEAD moved during creation', w.headMovedDuringCreate === true, JSON.stringify(w.headMovedDuringCreate));
+    check('the copy is still made from the recorded commit', w.baseCommit === base9);
+    const text = iso.describeWorkspace(w);
+    check('the description says the folder moved while the copy was being made', text.includes('moved while the copy was being made'), text.split('\n').slice(-8).join(' | '));
+  }
+}
+
+// --- 15. finding 6, rejected: belt and braces on a state root inside the checkout -------
+
+say('\n=== 15. finding 6 (rejected by triage): the one-line second guard ===');
+{
+  const R = join(ROOT, 'f6');
+  newRepo(R);
+  const inside = join(R, '.conductor-state');
+  const rigged = { ...config, stateRoot: inside };
+  const r = iso.createWorkspace(rigged, { id: 'f6', cwd: R });
+  say(`  create said: ${r.ok ? 'CREATED INSIDE THE REPO' : r.reason}`);
+  check('createWorkspace refuses a workspace path inside the repository', r.ok === false);
+  check('nothing was created inside the user folder', !existsSync(inside));
+  check("the user's folder is still clean", sh(R, ['status', '--porcelain']).trim() === '');
+  // The primary guard is loadConfig, which refuses the state root before the daemon starts at all.
+  process.env['CONDUCTOR_HOME'] = inside;
+  let threw = '';
+  try {
+    loadConfig();
+  } catch (err) {
+    threw = String(err);
+  }
+  process.env['CONDUCTOR_HOME'] = STATE;
+  say(`  loadConfig said: ${threw || 'NOTHING, it accepted a state root inside a checkout'}`);
+  check('loadConfig is the primary guard and refuses first', threw.includes('inside the git checkout'));
 }
 
 say('\n=== logbook lines written ===');
