@@ -36,8 +36,24 @@ export interface ApprovalRequest {
   reason: string;
 }
 
+/** What a door said, and which door said it. `door: null` means nobody was there to ask. */
+export interface ApprovalOutcome {
+  approved: boolean;
+  door: string | null;
+}
+
 /** A door answers this. With no door attached the answer is no, which is the safe default. */
-export type Approver = (request: ApprovalRequest) => Promise<boolean>;
+export type Approver = (request: ApprovalRequest) => Promise<ApprovalOutcome>;
+
+const NO_DOOR: ApprovalOutcome = { approved: false, door: null };
+
+/** What a door can do to a session while it runs. Handed out at start, withdrawn at the end. */
+export interface SessionHandle {
+  taskId: string;
+  /** Queue another user message into the running session's streaming input. */
+  send(text: string): void;
+  interrupt(): Promise<void>;
+}
 
 export interface RunSessionOptions {
   configDir: string;
@@ -46,6 +62,8 @@ export interface RunSessionOptions {
   onMessage?: (message: SDKMessage) => void;
   approve?: Approver;
   maxTurns?: number;
+  /** Called with the handle when the session starts and with null when it ends. */
+  onHandle?: (handle: SessionHandle | null) => void;
 }
 
 export interface SessionResult {
@@ -60,7 +78,11 @@ export interface SessionResult {
 // trust level says, per the spec's security section and the playbook's hard rails. Deliberately
 // blunt: a false stop costs a tap, a false pass costs the user's files.
 const DESTRUCTIVE_COMMAND =
-  /(^|[\n;&|]\s*)(rm|rmdir|del|erase|rd|format|mkfs|dd|shutdown|reboot|diskpart)\s|--force\b|-f\b\s+.*\brm\b|\bgit\s+(push|reset|clean|checkout\s+--|restore)\b|\bnpm\s+(publish|unpublish)\b|\|\s*(sh|bash|pwsh|powershell)\b/i;
+  /(^|[\n;&|]\s*)(rm|rmdir|del|erase|rd|unlink|shred|format|mkfs|dd|shutdown|reboot|diskpart)\s|\b(Remove-Item|Remove-ItemProperty|Clear-Content|Clear-Disk|Format-Volume)\b|--force\b|-f\b\s+.*\brm\b|\bgit\s+(push|reset|clean|checkout\s+--|restore|branch\s+-D|filter-branch)\b|\bnpm\s+(publish|unpublish)\b|\|\s*(sh|bash|pwsh|powershell)\b/i;
+
+// Commands asking for more authority than the session has. The SDK also refuses some of these on
+// its own; the rail does not depend on that and stops them here regardless.
+const ELEVATION_COMMAND = /\b(sudo|doas|runas|takeown|icacls|Start-Process\b[^\n]*-Verb\s+RunAs)\b|\breg(\.exe)?\s+(add|delete)\s+HKLM/i;
 
 // Tool inputs that name a path. Anything outside the task's cwd needs a tap even when autonomous.
 const PATH_FIELDS = ['file_path', 'path', 'notebook_path', 'edit_file_path'];
@@ -69,6 +91,11 @@ const PATH_FIELDS = ['file_path', 'path', 'notebook_path', 'edit_file_path'];
 // the next thing that happens.
 const CUT_DELAY_MS = 250;
 
+// A rail stop waits on a human, so the hook gets a long leash. If it ever runs out the SDK falls
+// back to the permission mode and layer two catches the call, which is why the leash is not
+// infinite.
+const RAIL_APPROVAL_TIMEOUT_SECONDS = 600;
+
 export async function runSession(config: Config, task: Task, options: RunSessionOptions): Promise<SessionResult> {
   const { gauge, configDir } = options;
 
@@ -76,6 +103,10 @@ export async function runSession(config: Config, task: Task, options: RunSession
   const state: { finish: FinishTaskCall | null } = { finish: null };
   let queryRef: Query | null = null;
   let cutTimer: NodeJS.Timeout | undefined;
+  // What the rail already put to a human, in this process, in this session. Layer two consults it
+  // so one destructive action costs one tap rather than two. Nothing else may write to it, so a
+  // call layer one never saw is still a call layer two stops.
+  const approvedAtRail = new Set<string>();
 
   const finishServer = createFinishTaskServer(config, task.title, (call) => {
     if (state.finish) return; // the first call is the cut; a second one changes nothing
@@ -89,20 +120,35 @@ export async function runSession(config: Config, task: Task, options: RunSession
     }, CUT_DELAY_MS);
   });
 
-  // One prompt per task in M1. The generator stays open after yielding it so the Query control
-  // methods remain usable at the boundary; the runner closes the query when the turn resolves.
-  let releaseInput: () => void = () => {};
-  const inputClosed = new Promise<void>((r) => {
-    releaseInput = r;
+  // One opening prompt per task, then the input stays open: the Query control methods the gauge
+  // needs only exist while it is, and a door can drop another user message into the queue while
+  // the turn is in flight. The runner closes the input when the turn resolves.
+  const queued: string[] = [];
+  let wake: (() => void) | null = null;
+  let inputClosed = false;
+  const releaseInput = () => {
+    inputClosed = true;
+    wake?.();
+    wake = null;
+  };
+  const userMessage = (content: string) => ({
+    type: 'user' as const,
+    message: { role: 'user' as const, content },
+    parent_tool_use_id: null,
+    session_id: '',
   });
   async function* prompts() {
-    yield {
-      type: 'user' as const,
-      message: { role: 'user' as const, content: options.openingPrompt },
-      parent_tool_use_id: null,
-      session_id: '',
-    };
-    await inputClosed;
+    yield userMessage(options.openingPrompt);
+    while (!inputClosed) {
+      const next = queued.shift();
+      if (next !== undefined) {
+        yield userMessage(next);
+        continue;
+      }
+      await new Promise<void>((r) => {
+        wake = r;
+      });
+    }
   }
 
   let pendingAutoCompact: string | null = null;
@@ -115,11 +161,51 @@ export async function runSession(config: Config, task: Task, options: RunSession
     // is spread first for PATH and friends, then the key that must never be present is removed.
     env: childEnv(configDir),
     permissionMode: task.trust === 'autonomous' ? 'acceptEdits' : 'default',
-    canUseTool: makePermissionGate(task, options.approve),
+    canUseTool: makePermissionGate(config, task, options.approve, approvedAtRail),
     mcpServers: { [FINISH_SERVER_NAME]: finishServer },
     allowedTools: [FINISH_TOOL_NAME], // asking permission to hand off would be silly
     maxTurns: options.maxTurns ?? 40,
     hooks: {
+      // The hard rail. It lives here rather than in canUseTool because the SDK is explicit that
+      // allow-rules in the user's own settings files shadow canUseTool without telling the host
+      // program, while hooks run whatever those rules say. canUseTool stays below as layer two.
+      PreToolUse: [
+        {
+          timeout: RAIL_APPROVAL_TIMEOUT_SECONDS,
+          hooks: [
+            async (input) => {
+              if (input.hook_event_name !== 'PreToolUse') return {};
+              if (input.tool_name === FINISH_TOOL_NAME) return {}; // asking to hand off would be silly
+              const toolInput = asRecord(input.tool_input);
+              const verdict = classifyRail(task, toolInput);
+              if (!verdict) return {}; // ordinary work: falls through to the permission mode and layer two
+
+              const request: ApprovalRequest = { taskId: task.id, toolName: input.tool_name, input: toolInput, reason: verdict.reason };
+              const { approved, door } = options.approve ? await options.approve(request).catch(() => NO_DOOR) : NO_DOOR;
+              if (approved) approvedAtRail.add(callKey(input.tool_name, toolInput));
+              logEvent(config, {
+                kind: 'rail_stop',
+                taskId: task.id,
+                toolName: input.tool_name,
+                layer: 'pre_tool_use',
+                kindOfRisk: verdict.risk,
+                reason: verdict.reason,
+                trust: task.trust,
+                decision: approved ? 'approved' : 'denied',
+                door,
+              });
+
+              return {
+                hookSpecificOutput: {
+                  hookEventName: 'PreToolUse' as const,
+                  permissionDecision: approved ? ('allow' as const) : ('deny' as const),
+                  permissionDecisionReason: approved ? `A human approved this: ${verdict.reason}.` : denialMessage(verdict.reason),
+                },
+              };
+            },
+          ],
+        },
+      ],
       // The documented per-turn injection point: whatever this returns as additionalContext is
       // added to the turn the model is about to answer.
       UserPromptSubmit: [
@@ -147,6 +233,18 @@ export async function runSession(config: Config, task: Task, options: RunSession
 
   const run = query({ prompt: prompts(), options: sdkOptions });
   queryRef = run;
+  options.onHandle?.({
+    taskId: task.id,
+    send: (text: string) => {
+      if (inputClosed) return;
+      queued.push(text);
+      wake?.();
+      wake = null;
+    },
+    interrupt: async () => {
+      await run.interrupt();
+    },
+  });
 
   const usage: TokenUsage = { input: 0, output: 0, cacheCreation: 0, cacheRead: 0 };
   let sessionId: string | undefined;
@@ -197,6 +295,7 @@ export async function runSession(config: Config, task: Task, options: RunSession
     }
     if (cutTimer) clearTimeout(cutTimer);
     releaseInput();
+    options.onHandle?.(null);
     try {
       run.close();
     } catch {
@@ -216,35 +315,89 @@ function childEnv(configDir: string): Record<string, string | undefined> {
 }
 
 /**
- * Trust maps to the permission mode; this gate sits underneath it and is the part trust cannot
- * widen. Destructive commands and anything reaching outside the task's own folder stop for a tap
- * whether the task is attended or autonomous. bypassPermissions is never used anywhere.
+ * Layer two. Trust maps to the permission mode; this gate sits underneath it and is the part trust
+ * cannot widen. It repeats the rail on purpose: the hook above is the one settings files cannot
+ * shadow, and this one still catches anything that reaches it. bypassPermissions is never used.
  */
-function makePermissionGate(task: Task, approve: Approver | undefined) {
+function makePermissionGate(config: Config, task: Task, approve: Approver | undefined, approvedAtRail: Set<string>) {
   return async (toolName: string, input: Record<string, unknown>): Promise<PermissionResult> => {
-    const reason = classify(task, toolName, input);
-    if (reason === null && task.trust === 'autonomous') return { behavior: 'allow', updatedInput: input };
+    const verdict = classifyRail(task, input);
+    if (verdict === null && task.trust === 'autonomous') return { behavior: 'allow', updatedInput: input };
+    // Measured: the SDK still consults canUseTool after a PreToolUse allow, so without this one
+    // destructive action costs the human two identical taps.
+    // The ticket is spent when it is used, so it covers exactly the call the human looked at.
+    if (verdict && approvedAtRail.delete(callKey(toolName, input))) return { behavior: 'allow', updatedInput: input };
 
-    const ask = reason ?? 'this task is attended, so tool use is confirmed by a human';
-    const approved = approve ? await approve({ taskId: task.id, toolName, input, reason: ask }) : false;
-    return approved
-      ? { behavior: 'allow', updatedInput: input }
-      : { behavior: 'deny', message: `Conductor did not get approval: ${ask}. Try a different approach or finish the task and say what is blocked.` };
+    const ask = verdict?.reason ?? 'this task is attended, so tool use is confirmed by a human';
+    const { approved, door } = approve ? await approve({ taskId: task.id, toolName, input, reason: ask }).catch(() => NO_DOOR) : NO_DOOR;
+    if (verdict) {
+      logEvent(config, {
+        kind: 'rail_stop',
+        taskId: task.id,
+        toolName,
+        layer: 'can_use_tool',
+        kindOfRisk: verdict.risk,
+        reason: verdict.reason,
+        trust: task.trust,
+        decision: approved ? 'approved' : 'denied',
+        door,
+      });
+    }
+    return approved ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: denialMessage(ask) };
   };
 }
 
+export type RailRisk = 'destructive' | 'elevated' | 'outside_cwd';
+
+export interface RailVerdict {
+  risk: RailRisk;
+  reason: string;
+}
+
 /** Returns why an action needs a human, or null when it is ordinary work inside the task folder. */
-function classify(task: Task, toolName: string, input: Record<string, unknown>): string | null {
+export function classifyRail(task: Task, input: Record<string, unknown>): RailVerdict | null {
   const outside = PATH_FIELDS.map((field) => input[field]).find(
     (value) => typeof value === 'string' && !insideCwd(task.cwd, value),
   );
-  if (typeof outside === 'string') return `it touches "${outside}", which is outside the task folder`;
+  if (typeof outside === 'string') {
+    return { risk: 'outside_cwd', reason: `it touches "${outside}", which is outside the task folder` };
+  }
 
-  const command = input['command'];
-  if (typeof command === 'string' && DESTRUCTIVE_COMMAND.test(command)) {
-    return 'the command can destroy or publish work, and destructive actions always need a tap';
+  // A notebook edit that removes a cell is a deletion in everything but name.
+  if (input['edit_mode'] === 'delete') {
+    return { risk: 'destructive', reason: 'it deletes content, and deletions always need a tap' };
+  }
+
+  const command = commandText(input);
+  if (command === null) return null;
+  if (ELEVATION_COMMAND.test(command)) {
+    return { risk: 'elevated', reason: 'the command asks for elevated permission, which a session never gets on its own' };
+  }
+  if (DESTRUCTIVE_COMMAND.test(command)) {
+    return { risk: 'destructive', reason: 'the command can destroy or publish work, and destructive actions always need a tap' };
   }
   return null;
+}
+
+/** Tool inputs spell a command as a string or as an argv array. Both get read. */
+function commandText(input: Record<string, unknown>): string | null {
+  const raw = input['command'];
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) return raw.filter((part) => typeof part === 'string').join(' ');
+  return null;
+}
+
+/** Identity of one tool call, so an approval covers that call and not the next one like it. */
+function callKey(toolName: string, input: Record<string, unknown>): string {
+  return `${toolName}:${JSON.stringify(input)}`;
+}
+
+function denialMessage(reason: string): string {
+  return `Conductor did not get approval: ${reason}. Try a different approach or finish the task and say what is blocked.`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 function insideCwd(cwd: string, candidate: string): boolean {

@@ -133,6 +133,20 @@ export interface ModelTotals {
   cacheRead: number;
 }
 
+/** Everything a door needs to show the gauge, with source and freshness on every number. */
+export interface GaugeSnapshot {
+  account: string;
+  fiveHour: Reading;
+  weekly: Reading;
+  selfMeteredTokens: number;
+  selfMeteredByModel: Record<string, ModelTotals>;
+  contextPercent: number | null;
+  contextPeakPercent: number | null;
+  fileAgeMs: number | null;
+  pressure: string | null;
+  line: string;
+}
+
 /**
  * Per-account gauge state. One instance per account for the life of the process, so self-metering
  * accumulates across the tasks in a chain the way a rolling window needs it to.
@@ -253,6 +267,26 @@ export class Gauge {
     });
 
     if (live) this.calibrate(live.fiveHour);
+  }
+
+  /**
+   * Read-only view for the doors. Re-reads the cheap file layer so a door polling /gauge sees
+   * current numbers, and logs nothing: a door looking at the gauge is not an event.
+   */
+  snapshot(): GaugeSnapshot {
+    this.file = readOfficialFile(this.configDir);
+    return {
+      account: this.account,
+      fiveHour: this.pick('fiveHour'),
+      weekly: this.pick('weekly'),
+      selfMeteredTokens: this.selfMeteredTokens,
+      selfMeteredByModel: this.selfMeteredByModel,
+      contextPercent: this.contextPercent,
+      contextPeakPercent: this.contextPeak,
+      fileAgeMs: this.file?.ageMs ?? null,
+      pressure: this.pressure,
+      line: this.line(),
+    };
   }
 
   /** The one line injected into every turn. Calm, per the spec's wording rule. */

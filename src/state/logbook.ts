@@ -44,7 +44,21 @@ export type ConductorEvent =
   | { kind: 'calibration'; account: string; bucketId: string; predictedPercent: number; officialPercent: number; gap: number; fetchedAt: string }
   // Auto-compact fired. Every one of these means the one-task-one-cut loop failed.
   | { kind: 'backstop_compact'; sessionId?: string; taskId?: string; trigger: string; preTokens?: number; postTokens?: number }
-  | { kind: 'limit_event'; account: string; status: string; window?: string; resetsAt?: string | null };
+  | { kind: 'limit_event'; account: string; status: string; window?: string; resetsAt?: string | null }
+  // A hard rail stopped a tool call. Every stop is logged, approved or not, so the trail shows
+  // both what was refused and what a human waved through.
+  | {
+      kind: 'rail_stop';
+      taskId: string;
+      toolName: string;
+      layer: 'pre_tool_use' | 'can_use_tool';
+      kindOfRisk: 'destructive' | 'elevated' | 'outside_cwd';
+      reason: string;
+      trust: 'attended' | 'autonomous';
+      decision: 'approved' | 'denied';
+      /** Which door answered, or null when no door was attached and the answer was the safe no. */
+      door: string | null;
+    };
 
 export type LoggedEvent = ConductorEvent & { ts: string };
 
