@@ -1,5 +1,51 @@
 # Conductor build plan
 
+## Handoff, written before a context compact on 2026-08-02
+
+Read this first. It is the state of play in one page, written so nothing important depends on
+conversation memory. If it disagrees with the sections below, the sections below are the detail
+and this is the summary.
+
+**Where the work is.** M1 is merged to main and Conductor runs: one task, one deliberate cut, a
+written handoff into the next task, an honest four-layer gauge, an append-only logbook, and a CLI
+over a loopback server. It ships attended-only and deliberately tap-heavy, because three
+adversarial review rounds broke three attempts at deciding which shell commands are safe. The
+vouched-safe set is empty and unattended trust is refused at three gates.
+
+**The live branch is `feat/m2-checkpoints`, and most of it is superseded.** It holds a complete
+checkpoint-and-undo implementation, three Sol reviews and two fix rounds. Sol failed it twice; the
+second failure was structural rather than fixable, because comparing a working folder before and
+after proves *timing*, not *authorship*, so undo would destroy a human's concurrent edits and
+report it as cleanup. Kane chose isolation instead. The reviews were not wasted: they are the
+evidence that the approach could not be made safe. The code largely goes.
+
+**The next task is to build isolation**, per SPEC revision 5 (committed, `28b3dca`). Each task
+gets its own working copy created from a named commit, on its own branch, outside the user's
+folder. Undo becomes discarding the copy. Provenance stops being inferred and becomes structural.
+Build it fresh rather than editing `checkpoint.ts`; the only pieces worth keeping are the non-git
+refusal and the argv-array git wrapper (`gitEnv` strips the inherited `GIT_*` namespace, which was
+a real Sol finding). Then Sol reviews it with the standing note that two prior approaches failed.
+
+**Then, in order:** slice B, the rail rebuilt on argument vectors and filesystem place enforcement,
+which isolation makes tractable. Slice C, the permissive default, which is the thing Kane actually
+asked for and cannot honestly ship before A and B. Then the durable queue with pacing, the inbox
+for continuous brain dumps, the notebook, and subagent account routing.
+
+**Waiting on Kane, neither blocking:** whether a refusal fallback should quietly restore the model
+or stop and say so; and two opening-round decisions that were picks from an AI-framed menu rather
+than his own words (D9 approvals, largely overtaken by the isolation model, and D5 state location,
+chosen before the repo was known to be public).
+
+**Two facts about this machine that cost time to learn.** The codex read-only sandbox cannot launch
+a process here, so Sol must be briefed with files inlined and line-numbered rather than left to
+read them. And the refusal-fallback swap from Fable to Opus is persistent for the session by
+design, so `/model` does not reliably undo it; a fresh session does. The work most likely to
+trigger it is Conductor's own rail hardening, so expect it again.
+
+**Note for whoever reads this next:** Kane has progressed the scope program in `nexwave-apps`
+extensively in parallel. Anything this file says about that repo is stale. Re-read
+`nexwave-apps/scope/` before acting on it rather than trusting a summary here.
+
 ## Morning report, 2026-08-01
 
 **M1 is merged to main. Conductor runs.** It does one task, cuts the context on purpose, carries a
