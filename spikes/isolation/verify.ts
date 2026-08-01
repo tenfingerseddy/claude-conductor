@@ -7,7 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -766,6 +766,15 @@ type GitHook = (args: string[]) => GitText | null;
 type RealpathHook = (path: string) => string;
 const hooks = globalThis as unknown as { __conductorGitHook?: GitHook; __conductorRealpathHook?: RealpathHook };
 
+/**
+ * Is this git call the one that reads our branch's tip? Written to match either probe, because the
+ * same file has to run against 799ec69, which asks with `rev-parse --verify --quiet`, and against the
+ * fix, which asks with `for-each-ref`. Both pass the full ref as its own argument.
+ */
+function isTipProbe(args: string[], ref: string): boolean {
+  return (args.includes('rev-parse') || args.includes('for-each-ref')) && args.includes(ref);
+}
+
 const GIT_SEAM = "  const result = spawnSync('git', args, {";
 const REALPATH_SEAM = '    return realpathSync.native(resolve(path));';
 
@@ -840,8 +849,7 @@ say('\n=== 21. item 1: an unreadable branch tip must stop the discard, not silen
     // complaint on stderr. `git worktree list` still answers, so ownership is confirmed and the code
     // reaches the tip read. This is the combination the machine will not stage: a broken loose ref
     // makes `worktree list` drop the branch line too, which lands in the mismatch refusal instead.
-    hooks.__conductorGitHook = (args) =>
-      args.includes('rev-parse') && args.includes(target) ? { ok: false, stdout: '', stderr: 'fatal: cannot read refs' } : null;
+    hooks.__conductorGitHook = (args) => (isTipProbe(args, target) ? { ok: false, stdout: '', stderr: 'fatal: cannot read refs' } : null);
     const d = seamed.discardWorkspace(config, w);
     hooks.__conductorGitHook = undefined;
 
@@ -872,7 +880,7 @@ say('--- item 1, second half: a deletion whose outcome cannot be confirmed ---')
     let seenTipReads = 0;
     hooks.__conductorGitHook = (args) => {
       if (args[0] === 'update-ref') return { ok: false, stdout: '', stderr: 'error: cannot lock ref' };
-      if (args.includes('rev-parse') && args.includes(target)) {
+      if (isTipProbe(args, target)) {
         seenTipReads++;
         if (seenTipReads > 1) return { ok: false, stdout: '', stderr: 'fatal: cannot read refs' };
       }
@@ -928,6 +936,168 @@ say('\n=== 22. item 2: a failed canonicalisation must refuse, not fall back to a
   say(`  dangling junction: ${r4.ok ? 'CREATED' : r4.reason.slice(0, 140)}`);
   check('a dangling junction under the state root never ends in a copy', r4.ok === false);
   check("the user's folder is still clean after that too", sh(R, ['status', '--porcelain']).trim() === '');
+}
+
+// ================================================================================
+// Sol's pass on 799ec69. Two refinements of the same crank: a probe that cannot really tell absence
+// from silence, and a write still standing in front of the strict check rather than behind it.
+// ================================================================================
+
+// --- 23. item 1: the tip probe's three answers, and which one silence belongs to -------------
+
+say('\n=== 23. item 1: for-each-ref carries the distinction in its exit code, not its silence ===');
+{
+  const R = join(ROOT, 'p1');
+  newRepo(R);
+  sh(R, ['branch', 'conductor/task-present']);
+  const probe = (ref: string): { code: number | null; out: string; err: string } =>
+    shSoft(R, ['--no-optional-locks', 'for-each-ref', ref, '--format=%(objectname)']);
+
+  // Raw output on this git version, so the mapping in branchTip is not taken on trust.
+  say(`  git version: ${sh(R, ['--version']).trim()}`);
+  for (const [label, ref] of [
+    ['present', 'refs/heads/conductor/task-present'],
+    ['absent', 'refs/heads/conductor/task-nothing-here'],
+  ] as const) {
+    const p = probe(ref);
+    say(`  ${label.padEnd(8)} exit=${p.code} stdout=${JSON.stringify(p.out)} stderr=${JSON.stringify(p.err)}`);
+  }
+  const present = probe('refs/heads/conductor/task-present');
+  check('present: exit 0 with a hash', present.code === 0 && /^[0-9a-f]{40}$/.test(present.out.trim()));
+  const absent = probe('refs/heads/conductor/task-nothing-here');
+  check('absent: exit 0 with nothing, which is an answer rather than a failure', absent.code === 0 && absent.out.trim() === '' && absent.err.trim() === '');
+
+  // A ref file holding something that is not a hash. This is the case the exit code alone would call
+  // absent, and the reason branchTip treats an empty answer with stderr on it as unreadable.
+  mkdirSync(join(R, '.git', 'refs', 'heads', 'conductor'), { recursive: true });
+  writeFileSync(join(R, '.git', 'refs', 'heads', 'conductor', 'task-broken'), 'this is not a hash\n');
+  const broken = probe('refs/heads/conductor/task-broken');
+  say(`  broken   exit=${broken.code} stdout=${JSON.stringify(broken.out)} stderr=${JSON.stringify(broken.err.trim())}`);
+  check('broken ref: exit 0, no hash, but git says something on stderr', broken.code === 0 && broken.out.trim() === '' && broken.err.trim() !== '');
+
+  const badRepo = join(ROOT, 'p1-bad');
+  newRepo(badRepo);
+  writeFileSync(join(badRepo, '.git', 'config'), readFileSync(join(badRepo, '.git', 'config'), 'utf8') + '[core\nnot a valid line\n');
+  const refused = shSoft(badRepo, ['--no-optional-locks', 'for-each-ref', 'refs/heads/main', '--format=%(objectname)']);
+  say(`  refused  exit=${refused.code} stderr=${JSON.stringify(refused.err.trim().split('\n')[0])}`);
+  check('unreadable repository: non-zero, which is what the mapping keys on', refused.code !== 0);
+}
+
+say('--- the same three answers as Conductor behaviour ---');
+{
+  // present: a leftover branch of our name that git cannot vouch for is named and left alone.
+  const R = join(ROOT, 'p2');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'p2', cwd: R });
+  check('p2 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    sh(R, ['worktree', 'remove', '--force', w.worktreePath]);
+    const d = seamed.discardWorkspace(config, w);
+    check('present -> discard succeeds with a note naming the branch', d.ok === true && typeof d.note === 'string' && d.note.includes(w.branch), d.ok ? String(d.note) : d.reason);
+    check('and the branch really was left alone', shSoft(R, ['show-ref', '--verify', '--quiet', `refs/heads/${w.branch}`]).code === 0);
+    sh(R, ['branch', '-D', w.branch]);
+  }
+
+  // absent: the same situation with the branch already gone is a clean discard with nothing to say.
+  const R2 = join(ROOT, 'p3');
+  newRepo(R2);
+  const made2 = seamed.createWorkspace(config, { id: 'p3', cwd: R2 });
+  check('p3 create ok', made2.ok === true, made2.ok ? '' : made2.reason);
+  if (made2.ok) {
+    const w = made2.workspace;
+    sh(R2, ['worktree', 'remove', '--force', w.worktreePath]);
+    sh(R2, ['branch', '-D', w.branch]);
+    const d = seamed.discardWorkspace(config, w);
+    say(`  absent -> ${d.ok ? `ok${'note' in d && d.note ? ` (note: ${d.note})` : ', no note'}` : d.reason}`);
+    check('absent -> discard succeeds and says nothing about a branch', d.ok === true && !('note' in d && d.note));
+  }
+
+  // broken: forceable for real, and it must not read as absent.
+  const R3 = join(ROOT, 'p4');
+  newRepo(R3);
+  const made3 = seamed.createWorkspace(config, { id: 'p4', cwd: R3 });
+  check('p4 create ok', made3.ok === true, made3.ok ? '' : made3.reason);
+  if (made3.ok) {
+    const w = made3.workspace;
+    sh(R3, ['worktree', 'remove', '--force', w.worktreePath]);
+    writeFileSync(join(R3, '.git', 'refs', 'heads', 'conductor', 'task-p4'), 'this is not a hash\n');
+    const d = seamed.discardWorkspace(config, w);
+    say(`  broken -> ${d.ok ? 'ok' : d.reason.slice(0, 150)}`);
+    check('a broken ref does not read as a clean absence', d.ok === false);
+  }
+}
+
+say('--- the case the old probe got wrong: a failure with nothing on either stream ---');
+{
+  // This is Sol's actual point. `rev-parse --verify --quiet` exits non-zero for a missing ref AND for
+  // a repository that failed quietly, so the old code told them apart by whether git had written to
+  // stderr, and silence was read as absence. git 2.52 does not produce that silent failure on demand,
+  // so the seam produces it: exit non-zero, both streams empty. Under the old probe that is "no
+  // branch to delete"; under for-each-ref a non-zero exit is unreadable whatever the streams say.
+  const R = join(ROOT, 'p6');
+  newRepo(R);
+  const made = seamed.createWorkspace(config, { id: 'p6', cwd: R });
+  check('p6 create ok', made.ok === true, made.ok ? '' : made.reason);
+  if (made.ok) {
+    const w = made.workspace;
+    const target = `refs/heads/${w.branch}`;
+    hooks.__conductorGitHook = (args) => (isTipProbe(args, target) ? { ok: false, stdout: '', stderr: '' } : null);
+    const d = seamed.discardWorkspace(config, w);
+    hooks.__conductorGitHook = undefined;
+
+    say(`  discard said: ${d.ok ? `ok${'note' in d && d.note ? ` (${d.note})` : ', no note'}` : d.reason.slice(0, 160)}`);
+    check('a silent failure is not read as an absent branch', d.ok === false);
+    check('nothing was removed', existsSync(w.worktreePath));
+    check('the branch is still there', shSoft(R, ['show-ref', '--verify', '--quiet', target]).code === 0);
+    const good = seamed.discardWorkspace(config, w);
+    check('and it discards cleanly once git answers again', good.ok === true, good.ok ? '' : good.reason);
+  }
+}
+
+// --- 24. item 2: the write in front of the strict check ---------------------------------------
+
+say('\n=== 24. item 2: a state root that will not resolve must refuse before anything is created ===');
+{
+  const R = join(ROOT, 'p5');
+  newRepo(R);
+  const insideRepo = join(R, 'smuggled');
+  mkdirSync(insideRepo, { recursive: true });
+  // A junction partway along the state root's path, above the workspaces level, pointing into the
+  // repository. Resolving the state root would expose it. The seam makes exactly that resolution
+  // fail, which is the state this machine will not produce on demand and the reason the lexical
+  // fallback mattered: without it the junction is caught, with it the path stays innocently outside.
+  const linkDir = join(ROOT, 'p5-link');
+  symlinkSync(insideRepo, linkDir, 'junction');
+  const stateViaLink = join(linkDir, 'state');
+  mkdirSync(stateViaLink, { recursive: true });
+  const smuggledWorkspaces = join(insideRepo, 'state', 'workspaces');
+  rmSync(smuggledWorkspaces, { recursive: true, force: true });
+  say(`  state root ${stateViaLink}`);
+  say(`  really is  ${realpathSync.native(stateViaLink)}`);
+  check('the state root really does resolve inside the repository', realpathSync.native(stateViaLink).toLowerCase().startsWith(realpathSync.native(R).toLowerCase()));
+
+  hooks.__conductorRealpathHook = (p) => {
+    if (p.toLowerCase() === resolve(stateViaLink).toLowerCase()) throw new Error('EACCES: simulated canonicalisation failure');
+    return realpathSync.native(p);
+  };
+  const r = seamed.createWorkspace({ ...config, stateRoot: stateViaLink }, { id: 'p5', cwd: R });
+  hooks.__conductorRealpathHook = undefined;
+
+  say(`  create said: ${r.ok ? 'CREATED' : r.reason}`);
+  check('createWorkspace refuses when the state root could not be resolved', r.ok === false);
+  check('the refusal says the state root could not be resolved', r.ok === false && r.reason.includes('state root') && r.reason.includes('could not be resolved'));
+  // The whole point: no mkdir ran through the unresolved path, so nothing landed in the user's repo.
+  say(`  smuggled folder inside the repo exists? ${existsSync(smuggledWorkspaces)}`);
+  check('nothing was created inside the repository through the junction', !existsSync(smuggledWorkspaces));
+  check('no branch was created', shSoft(R, ['show-ref', '--verify', '--quiet', 'refs/heads/conductor/task-p5']).code !== 0);
+  check("the user's folder is still clean", sh(R, ['status', '--porcelain']).trim() === '');
+
+  // And with the resolution working, the same junction is caught by the containment check instead.
+  const r2 = seamed.createWorkspace({ ...config, stateRoot: stateViaLink }, { id: 'p5b', cwd: R });
+  say(`  unhooked: ${r2.ok ? 'CREATED' : r2.reason.slice(0, 120)}`);
+  check('with resolution working the junction is caught as containment', r2.ok === false && r2.reason.includes('is inside the repository'));
+  check('still nothing inside the repository', !existsSync(join(insideRepo, 'state', 'workspaces', 'p5b')));
 }
 
 say('\n=== logbook lines written ===');

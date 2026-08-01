@@ -219,22 +219,32 @@ function realPath(path: string): string {
 }
 
 /**
- * realPath for a path that does not exist yet: resolves the deepest ancestor that does, then puts
- * the missing tail back on.
+ * realPathStrict for a path that does not exist yet: resolves the deepest ancestor that does, then
+ * puts the missing tail back on. Null when that ancestor would not resolve.
  *
  * `realpathSync` fails on a path that is not there, and the fallback used to hand back the caller's
  * spelling. On this machine %TEMP% arrives as the 8.3 short name, so a state root that had not been
  * created yet stayed short while the repository root was long, and `relative()` between them said
  * "outside" for a folder that was plainly inside. Caught by the finding 6 reproduction failing
  * against the fix, which is the reproduction earning its keep.
+ *
+ * Strict, with no lenient twin, because it has exactly one caller and that caller decides
+ * containment before creating a directory. Sol's last pass: the old lexical fallback here sat in
+ * front of a `mkdirSync`, so a state root that would not resolve produced an unverified path and the
+ * directory was then created through whatever that path really led to. A write may not stand on a
+ * guess, and the strict check after the directory exists is too late to stop the write.
  */
-function realPathDeep(path: string): string {
+function realPathDeepStrict(path: string): string | null {
   let current = resolve(path);
   const tail: string[] = [];
   for (;;) {
-    if (existsSync(current)) return tail.length ? join(realPath(current), ...tail.reverse()) : realPath(current);
+    if (existsSync(current)) {
+      const real = realPathStrict(current);
+      if (real === null) return null;
+      return tail.length ? join(real, ...tail.reverse()) : real;
+    }
     const parent = dirname(current);
-    if (parent === current) return resolve(path);
+    if (parent === current) return null;
     tail.push(basename(current));
     current = parent;
   }
@@ -265,22 +275,36 @@ function headRef(repoRoot: string): string | null {
 /**
  * What a branch ref points at: a commit, nothing, or an answer git would not give.
  *
- * Sol's final pass, item 1. `rev-parse --verify --quiet` exits non-zero for both "no such branch" and
- * "this repository will not answer", and taking `.stdout.trim()` off it flattened the second into the
- * first. An empty string then read as "there is no branch to delete", so discard could remove a
- * worktree, silently skip the deletion, and log a clean success. The three cases are separated here
- * so no caller can collapse them again: an absent ref exits 1 with nothing on either stream, and
- * anything git actually complains about arrives on stderr.
+ * Sol's findings, item 1, twice over. First round: `rev-parse --verify --quiet` exits non-zero for
+ * both "no such branch" and "this repository will not answer", and taking `.stdout.trim()` off it
+ * flattened the second into the first. An empty string then read as "there is no branch to delete",
+ * so discard could remove a worktree, silently skip the deletion, and log a clean success.
+ *
+ * Second round: separating those two by whether git said anything on stderr does not actually
+ * separate them, because a repository that fails quietly looks exactly like a missing ref. The probe
+ * is therefore `for-each-ref`, whose exit code carries the distinction instead of its silence:
+ *
+ *   present     exit 0, the hash on stdout
+ *   absent      exit 0, nothing on stdout        <- an answer, not a failure
+ *   unreadable  non-zero                          <- git refused to answer at all
+ *
+ * Verified on git 2.52.0.windows.1, all three, plus the fourth case below.
+ *
+ * One refinement on top of that mapping. A ref whose file holds something that is not a hash makes
+ * `for-each-ref` exit 0 with empty output and "warning: ignoring broken ref" on stderr, which would
+ * otherwise read as a clean absence. Anything git had to say about the ref means it is not a clean
+ * absence, so an empty answer with output on stderr is unreadable. That errs towards refusing, which
+ * is the direction this whole file errs in.
  */
 type BranchTip = { state: 'present'; hash: string } | { state: 'absent' } | { state: 'unreadable'; detail: string };
 
 function branchTip(repoRoot: string, ref: string): BranchTip {
-  const result = gitRead(['rev-parse', '--verify', '--quiet', ref], { cwd: repoRoot });
-  const hash = result.stdout.trim();
-  if (result.ok) return hash ? { state: 'present', hash } : { state: 'unreadable', detail: 'git exited cleanly but named no commit' };
+  const result = gitRead(['for-each-ref', ref, '--format=%(objectname)'], { cwd: repoRoot });
   const detail = result.stderr.trim();
-  if (!detail && !hash) return { state: 'absent' };
-  return { state: 'unreadable', detail: detail || 'git could not read it' };
+  if (!result.ok) return { state: 'unreadable', detail: detail || 'git could not read it' };
+  const hash = result.stdout.trim();
+  if (hash) return { state: 'present', hash };
+  return detail ? { state: 'unreadable', detail } : { state: 'absent' };
 }
 
 // --- refusals ----------------------------------------------------------------
@@ -437,7 +461,17 @@ export function createWorkspace(config: Config, task: { id: string; cwd: string 
   };
 
   const leaf = branch.slice(BRANCH_PREFIX.length);
-  const lexicalWorkspacesDir = join(realPathDeep(config.stateRoot), 'workspaces');
+  // Strict before the first check, because the `mkdirSync` below is a write and the check in front of
+  // it is only as good as the path it is given. A state root whose deepest existing ancestor will not
+  // resolve is not a location, it is a guess, and the guess is exactly what a junction hides behind.
+  const stateRoot = realPathDeepStrict(config.stateRoot);
+  if (stateRoot === null) {
+    return refuse(
+      `the state root "${config.stateRoot}" could not be resolved to a real path, so Conductor cannot tell where it actually ` +
+        `leads and will not create anything under it. Nothing was created. Check that path, and any link along it, and try again.`,
+    );
+  }
+  const lexicalWorkspacesDir = join(stateRoot, 'workspaces');
   const lexicalRefusal = containmentRefusal(join(lexicalWorkspacesDir, leaf));
   if (lexicalRefusal) return refuse(lexicalRefusal);
 
