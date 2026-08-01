@@ -25,6 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { loadConfig, usableAccounts, type Config } from '../config.ts';
+import { applyUndo, checkpointRefusal, describePlan, findCheckpoint, previewUndo } from '../engine/checkpoint.ts';
 import { Gauge } from '../engine/gauge.ts';
 import type { Carry } from '../engine/cut.ts';
 import { trustRefusal, type ApprovalOutcome, type ApprovalRequest, type SessionHandle, type Task, type Trust } from '../engine/session.ts';
@@ -293,6 +294,12 @@ class Daemon {
     if (!prompt) return { error: 'prompt is required' };
     if (!cwd) return { error: 'cwd is required' };
 
+    // Gate one of two for reversibility. The task loop checkpoints again before it starts anything,
+    // so a task that got into the list some other way still cannot run unreversibly; this one exists
+    // so the human hears about it when queueing rather than when the run stalls.
+    const notReversible = checkpointRefusal(cwd);
+    if (notReversible) return { error: notReversible };
+
     const trustRaw = typeof body['trust'] === 'string' ? body['trust'] : 'attended';
     if (trustRaw !== 'attended' && trustRaw !== 'autonomous') return { error: 'trust must be attended or autonomous' };
     // Gate one of two. The task loop refuses the same thing again at run time, so a task that got
@@ -374,6 +381,46 @@ class Daemon {
       });
 
     return { started: true, count: pending.length };
+  }
+
+  /**
+   * Undo, the other half of the checkpoint. Two calls by design: the first returns the preview and
+   * changes nothing, the second carries `confirm: true` and does the work. Undo is destructive in
+   * its own right, so a single call that both describes and performs would be the wrong shape.
+   */
+  undo(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
+    if (this.running) {
+      return { status: 409, payload: { error: 'a run is in progress; stop it before undoing, or the undo and the task will fight over the same files' } };
+    }
+    const taskId = typeof body['taskId'] === 'string' && body['taskId'].trim() ? body['taskId'].trim() : undefined;
+    const record = findCheckpoint(this.config, taskId);
+    if (!record) {
+      return { status: 404, payload: { error: taskId ? `no checkpoint was recorded for task "${taskId}"` : 'no checkpoint has been recorded yet' } };
+    }
+
+    const preview = previewUndo(this.config, record);
+    if (!preview.ok) return { status: 409, payload: { error: preview.reason, taskId: record.taskId, ref: record.ref } };
+
+    const plan = preview.plan;
+    const base = {
+      taskId: record.taskId,
+      ref: record.ref,
+      commit: record.commit,
+      cwd: record.cwd,
+      repoRoot: record.repoRoot,
+      changes: plan.changes,
+      outsideTaskFolder: plan.outsideCount,
+      preview: describePlan(plan),
+    };
+
+    if (body['confirm'] !== true) {
+      return { status: 200, payload: { ...base, applied: false, note: 'nothing was changed. Send the same request with "confirm": true to apply it.' } };
+    }
+    if (plan.changes.length === 0) return { status: 200, payload: { ...base, applied: false, note: 'nothing to change.' } };
+
+    const outcome = applyUndo(this.config, plan);
+    this.broadcast({ type: 'undo', taskId: record.taskId, ref: record.ref, restored: outcome.restored, deleted: outcome.deleted });
+    return { status: 200, payload: { ...base, applied: true, restored: outcome.restored, deleted: outcome.deleted, failures: outcome.failures } };
   }
 
   private defaultAccount(): string | null {
@@ -510,6 +557,11 @@ async function handle(daemon: Daemon, options: DaemonOptions, req: IncomingMessa
     if (route === 'POST /run') {
       const result = daemon.startRun();
       return json(res, result.started ? 202 : 409, result);
+    }
+    if (route === 'POST /undo') {
+      const body = asRecord(await readJson(req));
+      const { status, payload } = daemon.undo(body);
+      return json(res, status, payload);
     }
     if (route === 'POST /stop') {
       // Wrinkle 4: Windows cannot deliver SIGINT to a child, so a programmatic stop needs a door.

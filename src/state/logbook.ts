@@ -29,6 +29,36 @@ export type ConductorEvent =
       usage?: TokenUsage;
     }
   | { kind: 'cut'; taskId: string; mode: 'fresh' | 'compact'; sessionId?: string; reason?: string }
+  // The before-image for a task. This line is also how undo finds the checkpoint again later, which
+  // is why it carries the repo root and the task folder and not only the ref.
+  | {
+      kind: 'checkpoint';
+      taskId: string;
+      ref: string;
+      commit: string;
+      tree: string;
+      repoRoot: string;
+      cwd: string;
+      /** Where the user's HEAD was when we looked. Recorded, never moved. Null in a fresh repo. */
+      head: string | null;
+      detached: boolean;
+      files: number;
+    }
+  // No before-image was taken, so no task ran. A refusal is logged as loudly as a checkpoint,
+  // because "nothing was captured" is the fact a later reader most needs.
+  | { kind: 'checkpoint_refused'; taskId: string; cwd: string; reason: string }
+  | {
+      kind: 'undo';
+      taskId: string;
+      ref: string;
+      commit: string;
+      repoRoot: string;
+      cwd: string;
+      restored: number;
+      deleted: number;
+      outsideLeftAlone: number;
+      failures: number;
+    }
   | {
       kind: 'gauge_reading';
       account: string;

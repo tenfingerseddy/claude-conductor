@@ -444,14 +444,28 @@ tap-heavy and unattended-incapable; M2 is what earns the freedom back honestly.
 
 Nothing else in M2 is safe without this, so it goes first.
 
-- [ ] Before each task in a git project, commit the working tree to a Conductor branch. Never to
+- [x] Before each task in a git project, commit the working tree to a Conductor ref. Never to
       the user's branch, never a push.
-- [ ] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
-- [ ] `undo last task` on every door: restore the tree to the task's checkpoint ref.
-- [ ] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
+- [x] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
+- [x] `undo last task` on every door: restore the tree to the task's checkpoint ref.
+- [x] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
       refusal beats a checkpoint that does not exist.
 - Finish line: a task makes a mess, one command puts it back exactly, proven on a scratch repo
   with a dirty tree beforehand.
+- Evidence: `src/engine/checkpoint.ts` on `feat/m2-checkpoints`. Full transcripts in
+  `docs/notes/m2-sliceA-findings.md`. A task edited a tracked file, edited a nested one, created two
+  files including one in a new directory, deleted a tracked file and clobbered the user's untracked
+  note; undo put every hash back and left `git status --porcelain` matching the pre-task status
+  exactly. Checkpointing is provably invisible to the user: status byte-identical before and after,
+  `.git/index` unchanged by its own hash, `ls-files -s` unchanged, HEAD unmoved, reflog unchanged,
+  the staged change still staged, and `git branch --list -a` showing only `main` while the checkpoint
+  lives under `refs/conductor`. Zero-commit repo, detached HEAD, subfolder scoping, non-git refusal
+  at both gates with no session started, and preview-without-confirmation all verified. Two bugs the
+  verification caught and the code now fixes: an 8.3 versus long path mismatch made undo silently
+  restore nothing, and `core.autocrlf` made every restored file differ from the file it replaced.
+  Two limits stated rather than skipped: `.gitignore`d files are not in the before-image and are
+  never touched, and an in-tree `.gitattributes` `text` declaration still normalises content. Nothing
+  about the rail, trust or permissions changed; autonomous trust is still refused.
 
 ### Slice B, place enforcement and shell-free execution (the rail rebuild)
 
@@ -709,6 +723,19 @@ Append here when a design call is made during the build. Date, decision, reason,
   human had actually decided. Kane's own words outrank picks against AI framing, which outrank AI
   recommendations, and each is marked. Applied retroactively to this file's decisions table and
   written into SPEC revision 4 as a design principle.
+- 2026-08-01. Checkpoints are taken with git plumbing against a scratch index, never with porcelain.
+  Reason: the user's repository state is not Conductor's to move. `GIT_INDEX_FILE` points at a file
+  in Conductor's own state root, so `add -A`, `write-tree` and `commit-tree` never read or write
+  `.git/index`, and the ref lives under `refs/conductor/` so it cannot appear in `git branch`. The
+  test that matters is that `git status --porcelain` is byte-identical before and after, and it is.
+- 2026-08-01. Checkpoint metadata lives in the logbook, not in a new state file. Reason: the
+  simplicity budget says state is four plain things, and undo needs only the ref, the repo root and
+  the task folder, all of which an append-only event line already carries.
+- 2026-08-01. Conductor's own git calls disable line-ending conversion. Reason: with `core.autocrlf`
+  on, `git add` stores LF and `git checkout-index` writes CRLF, so undo restored four files and all
+  four had different bytes from the ones they replaced. The checkpoint commit never joins the user's
+  history, so raw bytes cost nothing. An in-tree `.gitattributes` can still override this and that
+  limit is documented rather than papered over.
 - 2026-08-01. Brain dumps are a continuous input, not a kickoff step (Kane's own words). The inbox
   organ in SPEC revision 4 takes them: raw kept verbatim, absorbed at cut points, triaged into
   typed items, reversals stated loudly, superseded work marked rather than deleted, order

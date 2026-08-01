@@ -20,6 +20,8 @@ const USAGE = `conductor <command>
        [--account <name>] [--model <model>] [--title <text>]
                                every task is attended: --trust autonomous is refused until M2
   run                          start working the pending list
+  undo [taskId] [--yes]        put the task's folder back to its before-image
+                               without --yes it only shows what it would change
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
@@ -57,6 +59,8 @@ async function main(argv: string[]): Promise<number> {
       return await addTask(rest);
     case 'run':
       return await startRun();
+    case 'undo':
+      return await undo(rest);
     case 'stop':
       return await stopDaemon();
     case 'tail':
@@ -161,6 +165,43 @@ async function startRun(): Promise<number> {
   }
   out(`run started over ${String(response['count'])} task(s). Attach with "conductor watch" to see turns and answer approval stops.`);
   return 0;
+}
+
+/**
+ * Undo the last task, or a named one. Two round trips on purpose: the first asks for the preview and
+ * changes nothing, and only `--yes` sends the second. Undo is destructive, so a human sees the file
+ * list before anything moves, and forgetting the flag costs a reprint rather than a tree.
+ */
+async function undo(args: string[]): Promise<number> {
+  const { positional, flags } = parseFlags(args);
+  const taskId = positional[0]?.trim();
+  const confirm = flags['yes'] === 'true' || flags['y'] === 'true';
+
+  const preview = asRecord(await post('/undo', { ...(taskId ? { taskId } : {}), confirm: false }));
+  if (preview['error']) {
+    out(`conductor: ${String(preview['error'])}`);
+    return 1;
+  }
+  out(String(preview['preview'] ?? ''));
+
+  const changes = Array.isArray(preview['changes']) ? preview['changes'] : [];
+  if (changes.length === 0) return 0;
+  if (!confirm) {
+    out('');
+    out(`nothing has been changed. Run "conductor undo ${String(preview['taskId'])} --yes" to apply it.`);
+    return 0;
+  }
+
+  const applied = asRecord(await post('/undo', { taskId: preview['taskId'], confirm: true }));
+  if (applied['error']) {
+    out(`conductor: ${String(applied['error'])}`);
+    return 1;
+  }
+  const failures = Array.isArray(applied['failures']) ? applied['failures'] : [];
+  out('');
+  out(`undone: ${String(applied['restored'])} file(s) restored, ${String(applied['deleted'])} file(s) deleted.`);
+  for (const failure of failures) out(`  failed: ${String(failure)}`);
+  return failures.length > 0 ? 1 : 0;
 }
 
 /**
@@ -382,4 +423,15 @@ const code = await main(process.argv.slice(2)).catch((err: unknown) => {
   process.stderr.write(`conductor: ${err instanceof Error ? err.message : String(err)}\n`);
   return 1;
 });
-if (code >= 0) process.exit(code);
+// Setting exitCode rather than calling process.exit, because `undo` is the first command that makes
+// two HTTP calls in one invocation and that combination crashes Node 24.11.1 on Windows:
+// "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\\win\\async.c, line 76", with an
+// exit code of 127 after the command had already printed the right answer. Reproduced outside
+// Conductor with two bare fetch calls followed by process.exit, so it is the platform, not us.
+// Letting the loop drain by itself exits immediately and cleanly. The unref'd timer is a safety net
+// only: it can never hold the process open, and it exists so a future command that leaves a handle
+// alive fails loudly rather than hanging a terminal forever.
+if (code >= 0) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 5000).unref();
+}

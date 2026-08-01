@@ -8,6 +8,7 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveAccount, usableAccounts, type Config } from './config.ts';
+import { checkpointTask } from './engine/checkpoint.ts';
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
 import { Gauge } from './engine/gauge.ts';
@@ -94,6 +95,18 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
       if (!account) {
         const problem = `account "${task.account}" is not usable; check "${config.configFilePath}"`;
         const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: problem };
+        runs.push(blocked);
+        logTaskFinish(config, task.id, 'blocked', null, null, {});
+        options.onTaskFinish?.(blocked);
+        continue;
+      }
+
+      // The before-image, taken before a single token is spent. A task whose work cannot be undone
+      // does not start: an honest refusal beats a checkpoint that does not exist, and every later
+      // slice of M2 that loosens a permission is resting on this line being here.
+      const checkpoint = checkpointTask(config, task);
+      if (!checkpoint.ok) {
+        const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: checkpoint.reason };
         runs.push(blocked);
         logTaskFinish(config, task.id, 'blocked', null, null, {});
         options.onTaskFinish?.(blocked);
