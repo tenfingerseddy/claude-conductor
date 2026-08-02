@@ -30,7 +30,7 @@ export type Trust = 'attended' | 'autonomous';
  * so a task queued before an upgrade still cannot run.
  */
 export const AUTONOMOUS_UNAVAILABLE =
-  'autonomous trust is unavailable until M2 delivers checkpoints, place enforcement and shell-free execution. Queue this task as attended.';
+  'autonomous trust is unavailable until M2 delivers place enforcement and shell-free execution. Queue this task as attended.';
 
 /** Null when this trust level may run, or the sentence explaining why it may not. */
 export function trustRefusal(trust: Trust): string | null {
@@ -42,7 +42,16 @@ export interface Task {
   /** Short human title. Becomes the handoff filename and the note's heading. */
   title: string;
   prompt: string;
+  /**
+   * Where the session runs. Once isolation is in front of the loop this is the copy's workdir, not
+   * the folder the human named, and every path check in this file scopes to it for that reason.
+   */
   cwd: string;
+  /**
+   * The folder the human named, when `cwd` is a copy of it. Display only: nothing here compares
+   * against it, because the boundary the rail enforces is the copy and only the copy.
+   */
+  userCwd?: string;
   /** A name in the config.json account registry, not a directory and never an email. */
   account: string;
   trust: Trust;
@@ -674,7 +683,10 @@ export function classifyRail(task: Task, toolName: string, input: Record<string,
     (value) => typeof value === 'string' && !insideCwd(task.cwd, value),
   );
   if (typeof outside === 'string') {
-    return { risk: 'outside_cwd', reason: `it touches "${outside}", which is outside the task folder` };
+    // The comparison is against task.cwd and nothing else. userCwd only changes the sentence, so a
+    // human reading the tap can see that the folder being enforced is the task's own copy.
+    const where = task.userCwd ? `outside the task's own copy of "${task.userCwd}"` : 'outside the task folder';
+    return { risk: 'outside_cwd', reason: `it touches "${outside}", which is ${where}` };
   }
 
   // A notebook edit that removes a cell is a deletion in everything but name.

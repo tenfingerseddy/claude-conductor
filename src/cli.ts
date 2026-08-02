@@ -20,13 +20,10 @@ const USAGE = `conductor <command>
        [--account <name>] [--model <model>] [--title <text>]
                                every task is attended: --trust autonomous is refused until M2
   run                          start working the pending list
-  undo [taskId] [--yes]        put the task's folder back to its before-image
-                               without --yes it only shows what it would change
-       [--override-changed-after-task]
-                               also touch the paths undo is holding back, which it otherwise
-                               leaves alone and lists by name. Those are files changed after
-                               the task finished, or, when the task left no post-image, every
-                               difference, because provenance is then unknown
+  undo [taskId] [--yes]        discard the task's own copy: delete the worktree and its branch
+                               without --yes it only describes the copy and what would go.
+                               Your own folder is never touched either way, because the task
+                               never worked in it
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
@@ -173,45 +170,64 @@ async function startRun(): Promise<number> {
 }
 
 /**
- * Undo the last task, or a named one. Two round trips on purpose: the first asks for the preview and
- * changes nothing, and only `--yes` sends the second. Undo is destructive, so a human sees the file
- * list before anything moves, and forgetting the flag costs a reprint rather than a tree.
+ * Undo the last task, or a named one, by discarding the copy it worked in.
  *
- * The second call carries the first call's planId and planHash, so the daemon applies the list that
- * was printed above rather than one it works out again on arrival. If the tree moved in between, the
- * hash stops it and the human is told to look again.
+ * Two round trips on purpose: the first describes the copy and changes nothing, and only `--yes`
+ * sends the second. Discarding is total, and it deletes the branch the task's work was sealed onto,
+ * so a human sees what will go before it goes. Forgetting the flag costs a reprint.
+ *
+ * The confirming call names the taskId the preview resolved, rather than saying "the last one"
+ * twice: a copy created between the two calls must not be able to become the target.
  */
 async function undo(args: string[]): Promise<number> {
   const { positional, flags } = parseFlags(args);
-  const taskId = positional[0]?.trim();
+  const wanted = positional[0]?.trim();
   const confirm = flags['yes'] === 'true' || flags['y'] === 'true';
-  const override = flags['override-changed-after-task'] === 'true';
 
-  const preview = asRecord(await post('/undo', { ...(taskId ? { taskId } : {}), ...(override ? { overrideChangedAfterTask: true } : {}) }));
+  const preview = asRecord(await get(`/undo${wanted ? `?taskId=${encodeURIComponent(wanted)}` : ''}`));
   if (preview['error']) {
     out(`conductor: ${String(preview['error'])}`);
     return 1;
   }
-  out(String(preview['preview'] ?? ''));
 
-  const changes = Array.isArray(preview['changes']) ? preview['changes'] : [];
-  if (changes.length === 0) return 0;
+  const taskId = String(preview['taskId']);
+  out(String(preview['workspace'] ?? ''));
+  out('');
+  out('discarding would:');
+  out(`  remove the copy    ${String(preview['worktreePath'])}`);
+  out(`  delete the branch  ${String(preview['branch'])}`);
+  out(`  seal state         ${sealLine(preview)}`);
+  out(`  leave alone        ${String(preview['repoRoot'])}, your own folder`);
+
   if (!confirm) {
     out('');
-    out(`nothing has been changed. Run "conductor undo ${String(preview['taskId'])} --yes${override ? ' --override-changed-after-task' : ''}" to apply exactly the list above.`);
+    out(`nothing has been changed. Run "conductor undo ${taskId} --yes" to discard exactly this copy.`);
     return 0;
   }
 
-  const applied = asRecord(await post('/undo', { confirm: true, planId: preview['planId'], planHash: preview['planHash'] }));
-  if (applied['error']) {
-    out(`conductor: ${String(applied['error'])}`);
+  const done = asRecord(await post('/undo', { taskId, confirm: true }));
+  if (done['error']) {
+    out('');
+    out(`conductor: ${String(done['error'])}`);
     return 1;
   }
-  const failures = Array.isArray(applied['failures']) ? applied['failures'] : [];
   out('');
-  out(`undone: ${String(applied['restored'])} file(s) restored, ${String(applied['deleted'])} file(s) deleted.`);
-  for (const failure of failures) out(`  failed: ${String(failure)}`);
-  return failures.length > 0 ? 1 : 0;
+  out(`discarded: the copy at "${String(done['worktreePath'])}" is gone and the branch "${String(done['branch'])}" is deleted.`);
+  if (done['note']) out(`  note: ${String(done['note'])}`);
+  return 0;
+}
+
+/** What the logbook says about the seal, said in words rather than in a boolean nobody can read. */
+function sealLine(preview: Record<string, unknown>): string {
+  if (typeof preview['sealFailure'] === 'string') {
+    return `the seal failed, so the branch holds no commit from this task (${String(preview['sealFailure'])})`;
+  }
+  if (preview['sealed'] === true) {
+    const files = preview['files'];
+    return `sealed, ${typeof files === 'number' ? `${files} file(s)` : 'an unrecorded number of files'} committed on that branch`;
+  }
+  if (preview['sealed'] === false) return 'sealed with nothing to commit, so the task changed no files';
+  return 'the logbook does not say whether the work was sealed, so assume the branch may hold work';
 }
 
 /**
@@ -309,7 +325,12 @@ function render(event: Record<string, unknown>): string | null {
   const type = String(event['type']);
 
   if (type === 'session_message') return renderSessionMessage(String(event['taskId']), asRecord(event['message']));
-  if (type === 'task_started') return `\n=== task ${String(event['taskId'])} started: ${String(event['title'])} (${String(event['account'])}, ${String(event['trust'])}) ===`;
+  if (type === 'task_started') {
+    const head = `\n=== task ${String(event['taskId'])} started: ${String(event['title'])} (${String(event['account'])}, ${String(event['trust'])}) ===`;
+    // The description of the copy belongs here, at the top of the task, because what the copy lacks
+    // is what a human needs to know before the task starts acting on it rather than afterwards.
+    return typeof event['workspace'] === 'string' ? `${head}\n${event['workspace']}` : head;
+  }
   if (type === 'task_finished') {
     const error = event['errorText'] ? `, error: ${String(event['errorText'])}` : '';
     return `=== task ${String(event['taskId'])} finished: ${String(event['outcome'])}${error} ===\n  handoff: ${String(event['handoffPath'] ?? 'none')}`;
@@ -317,6 +338,7 @@ function render(event: Record<string, unknown>): string | null {
   if (type === 'run_started') return `run started over ${(event['tasks'] as unknown[] | undefined)?.length ?? 0} task(s)`;
   if (type === 'run_done') return 'run done.';
   if (type === 'run_error') return `run error: ${String(event['error'])}`;
+  if (type === 'workspace_discarded') return `  (copy for task ${String(event['taskId'])} discarded, branch ${String(event['branch'])} deleted)`;
   if (type === 'approval_settled') return `  (approval ${String(event['id'])} ${event['approved'] === true ? 'approved' : 'denied'})`;
   if (type === 'error') return `daemon says: ${String(event['error'])}`;
   if (type === 'door_message') return `  (message sent to the session: ${String(event['text'])})`;

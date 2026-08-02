@@ -19,7 +19,19 @@ export interface TokenUsage {
 export type ConductorEvent =
   | { kind: 'daemon_start'; pid: number; stateRoot: string; version: string; accounts: number }
   | { kind: 'daemon_stop'; pid: number; reason: string }
-  | { kind: 'task_start'; taskId: string; account: string; model?: string; effort?: string; cwd?: string }
+  | {
+      kind: 'task_start';
+      taskId: string;
+      account: string;
+      model?: string;
+      effort?: string;
+      /** The folder the human named. The session never runs here; see workdir. */
+      cwd?: string;
+      /** Where the session actually ran: the isolated copy's counterpart of cwd. */
+      workdir?: string;
+      /** The branch the copy's work lands on, so a reader can find the output from this line alone. */
+      branch?: string;
+    }
   | {
       kind: 'task_finish';
       taskId: string;
@@ -29,53 +41,13 @@ export type ConductorEvent =
       usage?: TokenUsage;
     }
   | { kind: 'cut'; taskId: string; mode: 'fresh' | 'compact'; sessionId?: string; reason?: string }
-  // The before-image for a task. This line is also how undo finds the checkpoint again later, which
-  // is why it carries the repo root and the task folder and not only the ref.
-  | {
-      kind: 'checkpoint';
-      taskId: string;
-      ref: string;
-      commit: string;
-      tree: string;
-      repoRoot: string;
-      cwd: string;
-      /** Where the user's HEAD was when we looked. Recorded, never moved. Null in a fresh repo. */
-      head: string | null;
-      detached: boolean;
-      files: number;
-      /** Ref pinning the blob that lists what .gitignore covered when the checkpoint was taken. */
-      ignoredRef?: string | null;
-      /** A merge or rebase paused when the checkpoint was taken. Recorded, never restored. */
-      inProgress?: 'merge' | 'rebase' | null;
-    }
-  // No before-image was taken, so no task ran. A refusal is logged as loudly as a checkpoint,
-  // because "nothing was captured" is the fact a later reader most needs.
-  | { kind: 'checkpoint_refused'; taskId: string; cwd: string; reason: string }
-  // The task-end image. Pairs with the checkpoint above to make provenance a recorded fact rather
-  // than something undo infers: checkpoint..post-image is the task's work, post-image..now is not.
-  | { kind: 'postimage'; taskId: string; ref: string; commit: string; tree: string; repoRoot: string }
-  // No post-image, so provenance is unknown and undo refuses the blanket case. Logged rather than
-  // swallowed, because this is the line that explains the refusal later.
-  | { kind: 'postimage_failed'; taskId: string; reason: string }
-  | {
-      kind: 'undo';
-      taskId: string;
-      ref: string;
-      commit: string;
-      repoRoot: string;
-      cwd: string;
-      /** Whether the plan knew the task's own changes, or could only see checkpoint against now. */
-      provenance?: 'post-image' | 'unknown';
-      /** True when a human explicitly asked to touch changes the task did not make. */
-      override?: boolean;
-      restored: number;
-      deleted: number;
-      /** Differences left alone because somebody other than the task made them. */
-      heldBack?: number;
-      outsideLeftAlone: number;
-      failures: number;
-    }
   // --- isolation (M2 slice A-prime) ------------------------------------------
+  //
+  // These replace the checkpoint kinds this file used to carry (`checkpoint`, `checkpoint_refused`,
+  // `postimage`, `postimage_failed` and `undo`), deleted with src/engine/checkpoint.ts when tasks
+  // moved into their own copy. An events.jsonl written before that still holds those lines, and
+  // every reader here tolerates a kind it does not know: findWorkspace skips non-matching kinds,
+  // the daemon's /events and `conductor tail` pass whole lines through without inspecting kind.
   // A task's own copy of a project. This line is also how undo finds the copy again later, which is
   // why it carries the repo root, the branch and the worktree path and not only the task id.
   | {

@@ -25,7 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { loadConfig, usableAccounts, type Config } from '../config.ts';
-import { applyUndo, checkpointRefusal, describePlan, findCheckpoint, planFingerprint, previewUndo, type UndoPlan } from '../engine/checkpoint.ts';
+import { describeWorkspace, discardWorkspace, findWorkspace, isolationRefusal } from '../engine/isolation.ts';
 import { Gauge } from '../engine/gauge.ts';
 import type { Carry } from '../engine/cut.ts';
 import { trustRefusal, type ApprovalOutcome, type ApprovalRequest, type SessionHandle, type Task, type Trust } from '../engine/session.ts';
@@ -54,6 +54,10 @@ export interface QueuedTask extends Task {
   outcome: string | null;
   handoffPath: string | null;
   addedAt: string;
+  /** Set when the task starts, from the copy it was given. `cwd` stays the folder the human named. */
+  branch?: string;
+  worktreePath?: string;
+  workdir?: string;
 }
 
 export interface DaemonHandle {
@@ -84,16 +88,6 @@ interface PendingApproval {
 const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 // What a late-joining door gets replayed. Small on purpose: the logbook is the real history.
 const RECENT_LIMIT = 50;
-// How long a previewed undo plan stays confirmable. Long enough to read a file list, short enough
-// that a plan cannot be confirmed against a working tree that has moved on since.
-const UNDO_PLAN_TTL_MS = 5 * 60 * 1000;
-
-/** A previewed plan, held so the confirming call applies that list and not a freshly guessed one. */
-interface StoredUndoPlan {
-  plan: UndoPlan;
-  hash: string;
-  createdAt: number;
-}
 
 class Daemon {
   readonly config: Config;
@@ -106,8 +100,6 @@ class Daemon {
   /** Ids already answered. An approval is single-use; a replayed id is refused, not re-run. */
   private readonly spentApprovals = new Set<string>();
   private readonly recent: unknown[] = [];
-  /** Previewed undo plans, by plan id. Single use, and they expire. */
-  private readonly undoPlans = new Map<string, StoredUndoPlan>();
   private running = false;
   private currentTaskId: string | null = null;
   private handle: SessionHandle | null = null;
@@ -306,11 +298,11 @@ class Daemon {
     if (!prompt) return { error: 'prompt is required' };
     if (!cwd) return { error: 'cwd is required' };
 
-    // Gate one of two for reversibility. The task loop checkpoints again before it starts anything,
-    // so a task that got into the list some other way still cannot run unreversibly; this one exists
-    // so the human hears about it when queueing rather than when the run stalls.
-    const notReversible = checkpointRefusal(cwd);
-    if (notReversible) return { error: notReversible };
+    // Gate one of two for reversibility. The task loop makes the copy again before it starts
+    // anything, so a task that got into the list some other way still cannot run unreversibly; this
+    // one exists so the human hears about it when queueing rather than when the run stalls.
+    const notIsolatable = isolationRefusal(cwd);
+    if (notIsolatable) return { error: notIsolatable };
 
     const trustRaw = typeof body['trust'] === 'string' ? body['trust'] : 'attended';
     if (trustRaw !== 'attended' && trustRaw !== 'autonomous') return { error: 'trust must be attended or autonomous' };
@@ -362,10 +354,24 @@ class Daemon {
         this.carry = carry;
       },
       onMessage: (taskId, message) => this.onSessionMessage(taskId, message),
-      onTaskStart: (task) => {
+      onTaskStart: (task, workspace, description) => {
         this.currentTaskId = task.id;
-        this.patch(task.id, { status: 'running' });
-        this.broadcast({ type: 'task_started', taskId: task.id, title: task.title, account: task.account, trust: task.trust });
+        this.patch(task.id, { status: 'running', branch: workspace.branch, worktreePath: workspace.worktreePath, workdir: workspace.workdir });
+        // The description rides with task start rather than waiting for someone to ask, because what
+        // the copy lacks is the thing a human most needs to know before the task acts on it.
+        this.broadcast({
+          type: 'task_started',
+          taskId: task.id,
+          title: task.title,
+          account: task.account,
+          trust: task.trust,
+          cwd: task.cwd,
+          branch: workspace.branch,
+          worktreePath: workspace.worktreePath,
+          workdir: workspace.workdir,
+          baseCommit: workspace.baseCommit,
+          workspace: description,
+        });
       },
       onTaskFinish: (run: TaskRun) => {
         this.currentTaskId = null;
@@ -396,88 +402,119 @@ class Daemon {
   }
 
   /**
-   * Undo, the other half of the checkpoint. Two calls by design: the first returns the preview and
-   * changes nothing, the second carries `confirm: true` and does the work. Undo is destructive in
-   * its own right, so a single call that both describes and performs would be the wrong shape.
+   * Undo: discard the task's copy and delete its branch.
    *
-   * Sol's finding 3 was that the two-call shape did not actually enforce any of that: the confirming
-   * call computed its own plan and applied that one, and a first-and-only call carrying
-   * `confirm: true` was accepted, so what executed had never been shown to anybody. Consent is to a
-   * specific list of paths, so the preview now hands back a `planId` and a `planHash`, confirming
-   * must present both, and the daemon applies the stored plan. No prior preview, a hash that does
-   * not match, or a plan that has expired are all refusals.
+   * Still two calls, and still an explicit confirm, but the machinery in between is gone. The old
+   * shape carried a plan id and a fingerprint because in-place undo was selective: consent was to a
+   * particular list of paths, and that list could go stale against a folder that had moved on.
+   * Discard is total, so there is no list to drift and nothing to pin. What is left is worth
+   * keeping: discarding sealed work deletes the task's output branch, so a human sees what will go
+   * before it goes. The confirm binds to the taskId, which now identifies the whole operation.
+   *
+   * The preview reads and changes nothing. The confirming call must name the taskId itself rather
+   * than inherit "the last one", so a copy created between the two calls cannot become the target.
    */
-  undo(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
-    if (this.running) {
-      return { status: 409, payload: { error: 'a run is in progress; stop it before undoing, or the undo and the task will fight over the same files' } };
+  previewUndo(taskId: string | undefined): { status: number; payload: Record<string, unknown> } {
+    const workspace = findWorkspace(this.config, taskId);
+    if (!workspace) {
+      return {
+        status: 404,
+        payload: {
+          error: taskId
+            ? `no copy is recorded for task "${taskId}"; it may never have run, or it may already have been discarded`
+            : 'no copy has been made yet, so there is nothing to discard',
+        },
+      };
     }
-    return body['confirm'] === true ? this.applyPreviewedUndo(body) : this.previewUndoPlan(body);
-  }
 
-  private previewUndoPlan(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
-    const taskId = typeof body['taskId'] === 'string' && body['taskId'].trim() ? body['taskId'].trim() : undefined;
-    const record = findCheckpoint(this.config, taskId);
-    if (!record) {
-      return { status: 404, payload: { error: taskId ? `no checkpoint was recorded for task "${taskId}"` : 'no checkpoint has been recorded yet' } };
-    }
-
-    const preview = previewUndo(this.config, record, { overrideChangedAfterTask: body['overrideChangedAfterTask'] === true });
-    if (!preview.ok) return { status: 409, payload: { error: preview.reason, taskId: record.taskId, ref: record.ref } };
-
-    const plan = preview.plan;
-    const hash = planFingerprint(plan);
-    const planId = randomBytes(12).toString('hex');
-    this.pruneUndoPlans();
-    this.undoPlans.set(planId, { plan, hash, createdAt: Date.now() });
-
+    const seal = this.sealState(workspace.taskId);
     return {
       status: 200,
       payload: {
-        ...undoBase(plan),
-        planId,
-        planHash: hash,
-        expiresInSeconds: Math.round(UNDO_PLAN_TTL_MS / 1000),
-        applied: false,
+        taskId: workspace.taskId,
+        branch: workspace.branch,
+        worktreePath: workspace.worktreePath,
+        repoRoot: workspace.repoRoot,
+        baseCommit: workspace.baseCommit,
+        ...seal,
+        workspace: describeWorkspace(workspace),
+        discarded: false,
         note:
-          plan.changes.length === 0
-            ? 'nothing would be changed.'
-            : 'nothing was changed. Send "confirm": true with this planId and planHash to apply exactly this list.',
+          `nothing has been changed. Discarding deletes the copy at "${workspace.worktreePath}" and the branch ` +
+          `"${workspace.branch}"${seal.sealed ? `, which holds the task's ${seal.files} sealed file(s)` : ''}. ` +
+          `Your folder "${workspace.repoRoot}" is not touched either way.`,
       },
     };
   }
 
-  private applyPreviewedUndo(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
-    this.pruneUndoPlans();
-    const planId = typeof body['planId'] === 'string' ? body['planId'].trim() : '';
-    const planHash = typeof body['planHash'] === 'string' ? body['planHash'].trim() : '';
-    if (!planId || !planHash) {
-      return {
-        status: 400,
-        payload: { error: 'confirming an undo needs the planId and planHash from a preview. Ask for the preview first and confirm the list it returns.' },
-      };
+  discard(body: Record<string, unknown>): { status: number; payload: Record<string, unknown> } {
+    if (this.running) {
+      return { status: 409, payload: { error: 'a run is in progress; stop it before discarding, or the discard and the task will fight over the same copy' } };
     }
-    const stored = this.undoPlans.get(planId);
-    if (!stored) {
-      return { status: 409, payload: { error: 'that undo plan is unknown or has expired. Ask for a fresh preview and confirm that one.' } };
+    const taskId = typeof body['taskId'] === 'string' ? body['taskId'].trim() : '';
+    if (!taskId) {
+      return { status: 400, payload: { error: 'discarding a copy needs the taskId from the preview, so the confirm names what it is discarding' } };
     }
-    if (stored.hash !== planHash) {
-      return { status: 409, payload: { error: 'the planHash does not match the stored plan, so the list being confirmed is not the list that was previewed.' } };
+    if (body['confirm'] !== true) {
+      return { status: 400, payload: { error: 'discarding a copy needs "confirm": true. Ask for the preview first with GET /undo.' } };
     }
-    // Single use. A confirmed plan is spent whether it applied cleanly or not, so nothing can be
-    // replayed against a working tree it no longer describes.
-    this.undoPlans.delete(planId);
 
-    const plan = stored.plan;
-    if (plan.changes.length === 0) return { status: 200, payload: { ...undoBase(plan), applied: false, note: 'nothing to change.' } };
+    const workspace = findWorkspace(this.config, taskId);
+    if (!workspace) return { status: 404, payload: { error: `no copy is recorded for task "${taskId}"` } };
 
-    const outcome = applyUndo(this.config, plan);
-    this.broadcast({ type: 'undo', taskId: plan.record.taskId, ref: plan.record.ref, restored: outcome.restored, deleted: outcome.deleted });
-    return { status: 200, payload: { ...undoBase(plan), applied: true, restored: outcome.restored, deleted: outcome.deleted, failures: outcome.failures } };
+    const seal = this.sealState(workspace.taskId);
+    const outcome = discardWorkspace(this.config, workspace);
+    if (!outcome.ok) {
+      return { status: 409, payload: { error: outcome.reason, taskId: workspace.taskId, branch: workspace.branch, worktreePath: workspace.worktreePath, discarded: false } };
+    }
+    this.broadcast({ type: 'workspace_discarded', taskId: workspace.taskId, branch: workspace.branch, worktreePath: workspace.worktreePath });
+    return {
+      status: 200,
+      payload: {
+        taskId: workspace.taskId,
+        branch: workspace.branch,
+        worktreePath: workspace.worktreePath,
+        repoRoot: workspace.repoRoot,
+        ...seal,
+        discarded: true,
+        ...(outcome.note ? { note: outcome.note } : {}),
+      },
+    };
   }
 
-  private pruneUndoPlans(): void {
-    const cutoff = Date.now() - UNDO_PLAN_TTL_MS;
-    for (const [id, stored] of this.undoPlans) if (stored.createdAt < cutoff) this.undoPlans.delete(id);
+  /**
+   * Whether this task's work was sealed, and how much of it, read back out of the logbook.
+   *
+   * `sealed: null` is "the log does not say", which is neither sealed nor unsealed: a task that
+   * crashed before the seal ran and a log that could not be read look the same from here, and both
+   * mean the preview must not claim the branch is empty.
+   */
+  private sealState(taskId: string): { sealed: boolean | null; files: number | null; sealFailure?: string } {
+    let text: string;
+    try {
+      text = readFileSync(this.config.eventsPath, 'utf8');
+    } catch {
+      return { sealed: null, files: null };
+    }
+    const lines = text.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (event['taskId'] !== taskId) continue;
+      if (event['kind'] === 'workspace_sealed') {
+        return { sealed: event['committed'] === true, files: typeof event['files'] === 'number' ? event['files'] : null };
+      }
+      if (event['kind'] === 'workspace_seal_failed') {
+        return { sealed: false, files: null, sealFailure: String(event['reason'] ?? 'the seal failed') };
+      }
+    }
+    return { sealed: null, files: null };
   }
 
   private defaultAccount(): string | null {
@@ -515,25 +552,6 @@ class Daemon {
       // A door that cannot be written to is a door that has gone; never let it break the run.
     }
   }
-}
-
-/** The parts of an undo response that read the same whether it was previewed or applied. */
-function undoBase(plan: UndoPlan): Record<string, unknown> {
-  return {
-    taskId: plan.record.taskId,
-    ref: plan.record.ref,
-    commit: plan.record.commit,
-    cwd: plan.record.cwd,
-    repoRoot: plan.record.repoRoot,
-    changes: plan.changes,
-    held: plan.held,
-    provenance: plan.provenance,
-    override: plan.override,
-    caseCollisions: plan.caseCollisions,
-    ignoredSkipped: plan.ignoredSkipped.length,
-    outsideTaskFolder: plan.outsideCount,
-    preview: describePlan(plan),
-  };
 }
 
 /** A task that never handed off is aborted, which is neither done nor an error the model raised. */
@@ -634,9 +652,16 @@ async function handle(daemon: Daemon, options: DaemonOptions, req: IncomingMessa
       const result = daemon.startRun();
       return json(res, result.started ? 202 : 409, result);
     }
+    // Undo in two halves, and the verbs say which is which: a GET can only ever describe, and the
+    // POST is the only thing that removes anything.
+    if (route === 'GET /undo') {
+      const taskId = url.searchParams.get('taskId')?.trim();
+      const { status, payload } = daemon.previewUndo(taskId ? taskId : undefined);
+      return json(res, status, payload);
+    }
     if (route === 'POST /undo') {
       const body = asRecord(await readJson(req));
-      const { status, payload } = daemon.undo(body);
+      const { status, payload } = daemon.discard(body);
       return json(res, status, payload);
     }
     if (route === 'POST /stop') {

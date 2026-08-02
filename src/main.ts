@@ -8,10 +8,10 @@
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveAccount, usableAccounts, type Config } from './config.ts';
-import { checkpointTask, postImageTask } from './engine/checkpoint.ts';
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
 import { Gauge } from './engine/gauge.ts';
+import { createWorkspace, describeWorkspace, sealWorkspace, type Workspace } from './engine/isolation.ts';
 import { runSession, trustRefusal, type Approver, type SessionHandle, type Task } from './engine/session.ts';
 import { startDaemon } from './server/http.ts';
 import { logEvent, type TokenUsage } from './state/logbook.ts';
@@ -38,7 +38,8 @@ export interface RunTasksOptions {
   approve?: Approver;
   /** Gauges owned by the caller, so a long-lived daemon keeps self-metering across runs. */
   gauges?: Map<string, Gauge>;
-  onTaskStart?: (task: Task) => void;
+  /** The queued task, the copy it will run in, and the sentence describing that copy. */
+  onTaskStart?: (task: Task, workspace: Workspace, description: string) => void;
   onTaskFinish?: (run: TaskRun) => void;
   /** The running session's handle, or null when no session is running. */
   onHandle?: (handle: SessionHandle | null) => void;
@@ -101,17 +102,24 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
         continue;
       }
 
-      // The before-image, taken before a single token is spent. A task whose work cannot be undone
-      // does not start: an honest refusal beats a checkpoint that does not exist, and every later
-      // slice of M2 that loosens a permission is resting on this line being here.
-      const checkpoint = checkpointTask(config, task);
-      if (!checkpoint.ok) {
-        const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: checkpoint.reason };
+      // The isolated copy, made before a single token is spent. A task that cannot be given its own
+      // copy does not start, and there is deliberately no fallback to the user's folder: that
+      // fallback is the whole failure mode isolation exists to remove. Every later slice of M2 that
+      // loosens a permission rests on this line being here.
+      const created = createWorkspace(config, task);
+      if (!created.ok) {
+        const blocked: TaskRun = { taskId: task.id, sessionId: undefined, outcome: 'blocked', handoffPath: null, followUps: [], usage: {}, errorText: created.reason };
         runs.push(blocked);
         logTaskFinish(config, task.id, 'blocked', null, null, {});
         options.onTaskFinish?.(blocked);
         continue;
       }
+      const workspace = created.workspace;
+
+      // What the session sees. Its cwd is the copy, so every structured-tool path check scopes to
+      // the copy rather than to the folder the human is watching; `userCwd` keeps the folder they
+      // named available for anything that has to say where the copy came from.
+      const isolated: Task = { ...task, cwd: workspace.workdir, userCwd: task.cwd };
 
       let gauge = gauges.get(account.name);
       if (!gauge) {
@@ -126,18 +134,23 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
         taskId: task.id,
         account: account.name,
         cwd: task.cwd,
+        workdir: workspace.workdir,
+        branch: workspace.branch,
         ...(task.model ? { model: task.model } : {}),
       });
-      options.onTaskStart?.(task);
+      options.onTaskStart?.(task, workspace, describeWorkspace(workspace));
 
-      // The post-image, taken the moment the session stops for any reason. checkpoint..post-image is
-      // what the task did; post-image..now is what a human did afterwards. Without it undo can only
-      // diff the checkpoint against the present and guess which is which, which is how it came to
-      // delete somebody's later work and call it the task's. In a `finally`, because a task that
-      // crashes is exactly the one whose damage most needs attributing.
+      // The seal, taken the moment the session stops for any reason. A task that crashes is exactly
+      // the one whose work most needs capturing, so this is a `finally` and not a success path. The
+      // copy is never discarded here: the branch is the task's output, and discarding is the
+      // human's undo verb.
+      //
+      // A seal that fails must not eat the session's result. It is logged by sealWorkspace, its
+      // reason joins the run's errorText below, and the copy is left on disk with the work in it.
       let result;
+      let sealProblem: string | null = null;
       try {
-        result = await runSession(config, task, {
+        result = await runSession(config, isolated, {
           configDir: account.configDir,
           gauge,
           openingPrompt: buildOpeningPrompt(task.prompt, carry),
@@ -146,7 +159,13 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
           ...(options.onHandle ? { onHandle: options.onHandle } : {}),
         });
       } finally {
-        postImageTask(config, checkpoint.record);
+        const sealed = sealWorkspace(config, workspace);
+        if (!sealed.ok) {
+          sealProblem =
+            `the task's work could not be sealed onto "${workspace.branch}", so it is still uncommitted in ` +
+            `"${workspace.worktreePath}": ${sealed.reason}`;
+          process.stderr.write(`conductor: ${sealProblem}\n`);
+        }
       }
 
       const finish: FinishTaskCall | null = result.finish;
@@ -170,7 +189,12 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
         handoffPath: finish?.handoffPath ?? null,
         followUps: finish?.followUps ?? [],
         usage: result.usage,
-        errorText: result.errorText ?? (finish ? null : 'the session ended without calling finish_task'),
+        // Both problems, if both happened. A failed seal is a fact about the task's output and a
+        // failed session is a fact about its work; reporting only one of them loses the other.
+        errorText:
+          [result.errorText ?? (finish ? null : 'the session ended without calling finish_task'), sealProblem]
+            .filter((part): part is string => typeof part === 'string' && part.length > 0)
+            .join('; ') || null,
       };
       runs.push(run);
       options.onTaskFinish?.(run);
