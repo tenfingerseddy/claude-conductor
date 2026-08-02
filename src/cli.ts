@@ -25,6 +25,7 @@ const USAGE = `conductor <command>
                                Your own folder is never touched either way, because the task
                                never worked in it
   stop                         ask the daemon to shut down and log the stop
+  lost-time [--days N]         what waiting for usage limits cost, per account (default 7 days)
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
 `;
@@ -65,6 +66,8 @@ async function main(argv: string[]): Promise<number> {
       return await undo(rest);
     case 'stop':
       return await stopDaemon();
+    case 'lost-time':
+      return await lostTime(rest);
     case 'tail':
       return await tail(rest[0]);
     case 'watch':
@@ -92,6 +95,8 @@ async function showStatus(): Promise<number> {
   out(`conductor ${String(status['version'])}, pid ${String(status['pid'])}, up ${String(status['uptimeSeconds'])}s`);
   out(`  state root:  "${String(status['stateRoot'])}"`);
   out(`  running:     ${status['running'] === true ? `yes, task ${String(status['currentTask'])}` : 'no'}`);
+  const paused = status['paused'];
+  if (paused !== null && typeof paused === 'object') out(`  paused:      ${String(asRecord(paused)['sentence'])}`);
   out(`  doors open:  ${String(status['doors'])}`);
   out(`  accounts:    ${accounts.map((a) => `${String(asRecord(a)['name'])}${asRecord(a)['usable'] === true ? '' : ' (unusable)'}`).join(', ') || 'none'}`);
   out(`  tasks:       ${tasks.length}`);
@@ -246,6 +251,68 @@ async function stopDaemon(): Promise<number> {
   return 0;
 }
 
+/**
+ * The lost-time report. A small table and one honest sentence, no charts.
+ *
+ * The daemon does the arithmetic; this only lays it out. That is not ceremony: the same numbers
+ * have to reach the VS Code panel and the phone page without three implementations of "what counts
+ * as recoverable" drifting apart.
+ */
+async function lostTime(args: string[]): Promise<number> {
+  const { flags } = parseFlags(args);
+  const days = Number(flags['days'] ?? '7');
+  const report = asRecord(await get(`/lost-time?days=${Number.isFinite(days) && days > 0 ? days : 7}`));
+  if (report['error']) {
+    out(`conductor: ${String(report['error'])}`);
+    return 1;
+  }
+
+  const accounts = Array.isArray(report['accounts']) ? report['accounts'] : [];
+  const total = asRecord(report['total']);
+  const unmatched = Array.isArray(report['unmatched']) ? report['unmatched'] : [];
+
+  out(`lost time to usage limits, last ${String(report['days'])} day(s), since ${String(report['from'])}`);
+  out('');
+  if (accounts.length === 0) {
+    out('  no pauses recorded in this period. Nothing has been held back waiting for a limit to reset.');
+    return 0;
+  }
+
+  out(`  ${'account'.padEnd(14)}${'pauses'.padStart(7)}${'lost'.padStart(11)}${'longest'.padStart(11)}${'recoverable'.padStart(13)}`);
+  for (const raw of accounts) {
+    const row = asRecord(raw);
+    out(
+      `  ${String(row['account']).padEnd(14)}${String(row['pauses']).padStart(7)}` +
+        `${duration(row['lostMs']).padStart(11)}${duration(row['longestMs']).padStart(11)}${duration(row['recoverableMs']).padStart(13)}`,
+    );
+  }
+  out(`  ${'total'.padEnd(14)}${String(total['pauses'] ?? 0).padStart(7)}${duration(total['lostMs']).padStart(11)}${duration(total['longestMs']).padStart(11)}${duration(total['recoverableMs']).padStart(13)}`);
+
+  if (unmatched.length > 0) {
+    out('');
+    out(`  ${unmatched.length} pause(s) have no recorded end, so their length is unknown and is not in the totals:`);
+    for (const raw of unmatched) {
+      const row = asRecord(raw);
+      out(`    ${String(row['account'])} at ${String(row['at'])}, ${String(row['window'])} window, ${String(row['reason'])}`);
+    }
+  }
+
+  out('');
+  out(`  ${String(report['note'])}`);
+  return 0;
+}
+
+/** Milliseconds as something a person reads at a glance. */
+function duration(value: unknown): string {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '-';
+  const seconds = Math.round(value / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
 async function tail(countArg: string | undefined): Promise<number> {
   const count = Number(countArg ?? '20');
   const response = asRecord(await get(`/events?tail=${Number.isFinite(count) && count > 0 ? Math.floor(count) : 20}`));
@@ -336,6 +403,8 @@ function render(event: Record<string, unknown>): string | null {
     const error = event['errorText'] ? `, error: ${String(event['errorText'])}` : '';
     return `=== task ${String(event['taskId'])} finished: ${String(event['outcome'])}${error} ===\n  handoff: ${String(event['handoffPath'] ?? 'none')}`;
   }
+  if (type === 'limit_pause') return `\n--- ${String(event['sentence'])}\n    Ctrl+C still works, and "conductor stop" ends the wait and logs what it cost.`;
+  if (type === 'limit_resume') return '--- the wait is over; starting the task.';
   if (type === 'run_started') return `run started over ${(event['tasks'] as unknown[] | undefined)?.length ?? 0} task(s)`;
   if (type === 'run_done') return 'run done.';
   if (type === 'run_error') return `run error: ${String(event['error'])}`;

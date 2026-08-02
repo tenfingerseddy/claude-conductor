@@ -29,7 +29,7 @@ import { describeWorkspace, discardWorkspace, findWorkspace, isolationRefusal } 
 import { Gauge } from '../engine/gauge.ts';
 import type { Carry } from '../engine/cut.ts';
 import { trustRefusal, type ApprovalOutcome, type ApprovalRequest, type SessionHandle, type Task, type Trust } from '../engine/session.ts';
-import { runTasks, VERSION, type TaskRun } from '../main.ts';
+import { runTasks, VERSION, type PauseNotice, type TaskRun } from '../main.ts';
 import { logEvent } from '../state/logbook.ts';
 import { mintDaemonToken, tokenMatches } from '../state/token.ts';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
@@ -139,6 +139,8 @@ class Daemon {
   /** Previews that have happened, by token. Single use, and they expire. */
   private readonly undoPreviews = new Map<string, UndoPreview>();
   private running = false;
+  /** Set while a task is held back waiting for a limit window. Null the rest of the time. */
+  private paused: PauseNotice | null = null;
   private currentTaskId: string | null = null;
   private handle: SessionHandle | null = null;
   private nextId = 1;
@@ -279,6 +281,9 @@ class Daemon {
       uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
       stateRoot: this.config.stateRoot,
       running: this.running,
+      // Plainly, and at the top level rather than buried in the task list: a machine doing nothing
+      // looks identical to a machine that is broken unless it says which it is.
+      paused: this.paused,
       currentTask: this.currentTaskId,
       sessionAttached: this.handle !== null,
       doors: this.sockets.size,
@@ -326,6 +331,149 @@ class Daemon {
         return { raw: line };
       }
     });
+  }
+
+  /**
+   * What limits cost, per account, over the last N days.
+   *
+   * Read straight out of events.jsonl rather than from anything the daemon holds in memory, so a
+   * restart does not reset the number and a report can be run against a log the daemon never
+   * produced. Aggregation lives here rather than in the CLI because the CLI is a thin door: the
+   * phone and the VS Code panel must get the same figures without recomputing them.
+   *
+   * Three honesty rules the report keeps, because it is the number Kane will put in front of
+   * leadership when arguing for another account:
+   *
+   *   1. An unmatched pause, where the daemon died before its resume, counts as a pause and is
+   *      listed by name, but never contributes a guessed duration. A total that quietly includes
+   *      invented time is worse than a total with a footnote.
+   *   2. The recoverable share means only what it says: lost time during which another account's
+   *      reading, taken at pause start, showed room under the same threshold. Those readings come
+   *      from the file layer and the file layer goes stale, so the sentence says so.
+   *   3. Zero pauses is a real answer and prints as one, rather than as an empty table.
+   */
+  lostTime(days: number): Record<string, unknown> {
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    let text: string;
+    try {
+      text = readFileSync(this.config.eventsPath, 'utf8');
+    } catch {
+      return { days, error: 'the logbook could not be read, so there is nothing to report' };
+    }
+
+    interface Pause {
+      account: string;
+      ts: string;
+      window: string;
+      utilization: number;
+      reason: string;
+      otherHadHeadroom: boolean;
+      lostMs: number | null;
+      plannedMs: number | null;
+      interrupted: boolean;
+    }
+
+    const open = new Map<string, Pause>();
+    const pauses: Pause[] = [];
+
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const account = typeof event['account'] === 'string' ? event['account'] : '';
+      if (!account) continue;
+
+      if (event['kind'] === 'limit_pause') {
+        // A second pause with the first still open means the first never got its resume line.
+        const orphan = open.get(account);
+        if (orphan) pauses.push(orphan);
+        const threshold = typeof event['threshold'] === 'number' ? event['threshold'] : 100;
+        const others = Array.isArray(event['otherAccounts']) ? event['otherAccounts'] : [];
+        open.set(account, {
+          account,
+          ts: typeof event['ts'] === 'string' ? event['ts'] : '',
+          window: String(event['window'] ?? 'unknown'),
+          utilization: typeof event['utilization'] === 'number' ? event['utilization'] : NaN,
+          reason: String(event['reason'] ?? 'threshold'),
+          // Headroom means room on both windows. A null is an absent reading, never a zero, so it
+          // is not headroom either.
+          otherHadHeadroom: others.some((raw) => {
+            const other = asRecord(raw);
+            const five = other['fiveHour'];
+            const week = other['weekly'];
+            return typeof five === 'number' && five < threshold && typeof week === 'number' && week < threshold;
+          }),
+          lostMs: null,
+          plannedMs: null,
+          interrupted: false,
+        });
+        continue;
+      }
+
+      if (event['kind'] === 'limit_resume') {
+        const pause = open.get(account);
+        if (!pause) continue; // a resume with no pause in the window being read: nothing to attribute
+        open.delete(account);
+        pause.lostMs = typeof event['lostMs'] === 'number' ? event['lostMs'] : null;
+        pause.plannedMs = typeof event['plannedMs'] === 'number' ? event['plannedMs'] : null;
+        pause.interrupted = event['interrupted'] === true;
+        pauses.push(pause);
+      }
+    }
+    for (const pause of open.values()) pauses.push(pause); // still open, or the daemon died mid-wait
+
+    const inWindow = pauses.filter((pause) => {
+      const at = Date.parse(pause.ts);
+      return Number.isFinite(at) && at >= cutoff;
+    });
+
+    const byAccount = new Map<string, { account: string; pauses: number; lostMs: number; longestMs: number; recoverableMs: number; unknownDuration: number; interrupted: number }>();
+    for (const pause of inWindow) {
+      const row = byAccount.get(pause.account) ?? { account: pause.account, pauses: 0, lostMs: 0, longestMs: 0, recoverableMs: 0, unknownDuration: 0, interrupted: 0 };
+      row.pauses++;
+      if (pause.interrupted) row.interrupted++;
+      if (pause.lostMs === null) {
+        row.unknownDuration++;
+      } else {
+        row.lostMs += pause.lostMs;
+        row.longestMs = Math.max(row.longestMs, pause.lostMs);
+        if (pause.otherHadHeadroom) row.recoverableMs += pause.lostMs;
+      }
+      byAccount.set(pause.account, row);
+    }
+
+    const accounts = [...byAccount.values()].sort((a, b) => b.lostMs - a.lostMs);
+    const total = accounts.reduce(
+      (sum, row) => ({
+        pauses: sum.pauses + row.pauses,
+        lostMs: sum.lostMs + row.lostMs,
+        longestMs: Math.max(sum.longestMs, row.longestMs),
+        recoverableMs: sum.recoverableMs + row.recoverableMs,
+        unknownDuration: sum.unknownDuration + row.unknownDuration,
+        interrupted: sum.interrupted + row.interrupted,
+      }),
+      { pauses: 0, lostMs: 0, longestMs: 0, recoverableMs: 0, unknownDuration: 0, interrupted: 0 },
+    );
+
+    return {
+      days,
+      from: new Date(cutoff).toISOString(),
+      accounts,
+      total,
+      unmatched: inWindow
+        .filter((pause) => pause.lostMs === null)
+        .map((pause) => ({ account: pause.account, at: pause.ts, window: pause.window, utilization: pause.utilization, reason: pause.reason })),
+      note:
+        'Recoverable time is time lost while another account\'s reading showed room under the same threshold. ' +
+        'Those readings are taken from each account\'s file at the moment the pause started, and that file can be ' +
+        'stale, so treat the recoverable share as an indication rather than a measurement. Pauses with no recorded ' +
+        'end are counted and listed but contribute no time, because their length is unknown and guessing it would ' +
+        'inflate the figure this report exists to be trusted on.',
+    };
   }
 
   // --- task list -----------------------------------------------------------
@@ -392,6 +540,10 @@ class Daemon {
         this.carry = carry;
       },
       onMessage: (taskId, message) => this.onSessionMessage(taskId, message),
+      onPause: (pause) => {
+        this.paused = pause;
+        this.broadcast(pause ? { type: 'limit_pause', ...pause } : { type: 'limit_resume' });
+      },
       onTaskStart: (task, workspace, description) => {
         this.currentTaskId = task.id;
         this.patch(task.id, { status: 'running', branch: workspace.branch, worktreePath: workspace.worktreePath, workdir: workspace.workdir });
@@ -429,6 +581,7 @@ class Daemon {
       })
       .finally(() => {
         this.running = false;
+        this.paused = null;
         this.currentTaskId = null;
         this.handle = null;
         // Anything still marked running never reached onTaskFinish, so it is aborted, not pending.
@@ -775,6 +928,11 @@ async function handle(daemon: Daemon, options: DaemonOptions, req: IncomingMessa
     if (route === 'GET /events') {
       const tail = Number(url.searchParams.get('tail') ?? '20');
       return json(res, 200, { events: daemon.events(Number.isFinite(tail) ? tail : 20) });
+    }
+    if (route === 'GET /lost-time') {
+      const raw = Number(url.searchParams.get('days') ?? '7');
+      const days = Number.isFinite(raw) && raw > 0 ? Math.min(raw, 3650) : 7;
+      return json(res, 200, daemon.lostTime(days));
     }
     if (route === 'POST /tasks') {
       const body = asRecord(await readJson(req));

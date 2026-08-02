@@ -113,7 +113,8 @@ Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says wh
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 and M1 complete. M2 isolation merged to main. Slice B, place enforcement, is next.**
+Status: **M0 and M1 complete. M2 isolation merged to main. Slice L, lost time, is built on
+`feat/m2-lost-time`. Slice B, place enforcement, is next.**
 Last updated 2026-08-02.
 
 ## How to read this file
@@ -742,13 +743,56 @@ Only after A and B.
 - Finish line: an unattended queue runs a real chain overnight, and the morning shows what it did
   with an undo available for every step.
 
+### Slice L, lost time (the pause primitive, brought forward)
+
+Kane's own words, dictated 2026-08-02, so this is the strongest provenance grade: "Tracking lost
+time. If we slow or pause due to subscription limits, I want this measurable. We will look to
+potentially scale more accounts and I want tangible numbers to show leadership on why we need
+another and the efficiency or productivity gain it gives."
+
+Built out of order, before slices B and C, because it loosens nothing. A pause only ever stops work
+from starting, so it cannot widen a permission, and there is nothing to measure until something
+actually pauses.
+
+- [x] Before each task, the binding window is read and a task at or above the playbook's pause
+      threshold does not start. The service waits for the reset plus a 60-second grace, re-reads,
+      and proceeds. Threshold parsed leniently from `pause threshold: N%`, default 95, which is the
+      top rung of a ladder the gauge already had at 70 and the playbook at 85.
+- [x] The paid-credit boundary fires the pause at 100% of plan regardless of threshold, because
+      past that line the account spends money rather than stopping (S4's hazard, and the decisions
+      log's hard rail).
+- [x] A pause needs a reading it can stand on. Absent, stale by `fetchedAtMs`, or expired by its own
+      `resets_at` all mean no pause, and `limit_reading_unusable` says which. Both freshness tests
+      from the 2026-08-01 decisions-log entry are enforced here.
+- [x] `limit_pause` and `limit_resume` in the logbook, the pause carrying every other usable
+      account's 5-hour and weekly reading taken at that moment, names only per the scrub rule.
+- [x] `GET /lost-time?days=N` and `conductor lost-time [--days N]`: per account and total, the pause
+      count, total lost time, longest wait, and the recoverable share. Unmatched pauses are counted
+      and listed and never given a guessed duration.
+- [x] A daemon stop mid-pause logs `limit_resume` with `interrupted: true` before the process goes,
+      so a wait cut short is still a measured wait rather than a hole.
+- Finish line: through the real daemon and CLI on a scratch state root, a task is held back by a
+  synthetic reading, the pause is visible in `watch` and `/status`, the task starts after the reset,
+  a stale reading produces no pause, `conductor lost-time` reconciles by hand against the events,
+  and a stop mid-pause records the interruption.
+- Evidence: pause, resume, both unusable-reading cases, the paid-credit reason, a stop mid-pause, an
+  unmatched pause and the report reconciled by hand, all through the real daemon and CLI on a
+  scratch state root. Transcripts in `docs/notes/m2-losttime-findings.md`. Two wording defects found
+  and fixed during verification, both recorded there.
+- **Slice D builds on this.** The pause primitive is the mechanism slice D's scheduler drives: when
+  the queue learns to hold heavy work for a reset and fill the remaining headroom with light work,
+  it does the holding through this, and the lost-time number is how anyone tells whether the pacing
+  brain helped.
+
 ### Slice D, the queue with pacing
 
 - [ ] Durable ordered queue on disk, surviving a daemon restart (closes the two parked Sol
       findings about handoff recovery and follow-up queueing).
 - [ ] `finish_task` follow-ups land in it automatically.
 - [ ] Scheduling reads the gauge and the playbook: heavy work waits for resets, light work fills
-      remaining headroom, and the paid-credit boundary is a hard stop.
+      remaining headroom, and the paid-credit boundary is a hard stop. Both the waiting and the
+      hard stop already exist as the pause primitive from slice L; what is missing here is the
+      choosing, which task runs when. Do not build a second waiting mechanism.
 - Finish line: a queue with a heavy task and a light one paces correctly against a real window.
 
 ### Slice E, the inbox

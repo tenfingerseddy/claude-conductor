@@ -112,6 +112,40 @@ export type ConductorEvent =
   // Auto-compact fired. Every one of these means the one-task-one-cut loop failed.
   | { kind: 'backstop_compact'; sessionId?: string; taskId?: string; trigger: string; preTokens?: number; postTokens?: number }
   | { kind: 'limit_event'; account: string; status: string; window?: string; resetsAt?: string | null }
+  // --- lost time -------------------------------------------------------------
+  //
+  // Conductor stopped a task from starting because the account had no room. These two lines are the
+  // whole measurement: a pause says what it is waiting for and what the other tanks held at that
+  // moment, and its resume says what the wait actually cost. Scaling an account is a spending
+  // decision, so it deserves a measured number rather than a feeling that things sometimes stall.
+  | {
+      kind: 'limit_pause';
+      account: string;
+      window: 'session_5h' | 'weekly_all';
+      utilization: number;
+      resetsAt: string;
+      threshold: number;
+      /** `paid_credit_boundary` means the account would have started spending money, not stopped. */
+      reason: 'threshold' | 'paid_credit_boundary';
+      /** How many tasks were behind this one, including it, when the wait started. */
+      tasksWaiting: number;
+      /**
+       * What every other usable account read at pause start. Names only, the ones already in the
+       * user's own config; no emails and no account identifiers, per the scrub rule. A null
+       * percentage is an absent reading and never a zero, and these are file reads, so they carry
+       * the staleness the file layer always carries. The report says so in words rather than
+       * letting a reader assume otherwise.
+       */
+      otherAccounts: { account: string; fiveHour: number | null; weekly: number | null }[];
+    }
+  // lostMs is wall clock actually spent waiting. plannedMs is what the pause said it would be when
+  // it started, so the two disagreeing is itself worth seeing. interrupted means the daemon stopped
+  // mid-wait, so the task never did start.
+  | { kind: 'limit_resume'; account: string; lostMs: number; plannedMs: number; interrupted: boolean }
+  // The gauge could not say where the window stood, so nothing was paused. Logged because a silent
+  // "no reading, carry on" and a silent "no reading, stop" are indistinguishable afterwards, and one
+  // of them idles a full tank.
+  | { kind: 'limit_reading_unusable'; account: string; taskId: string; reason: string }
   // A hard rail stopped a tool call. Every stop is logged, approved or not, so the trail shows
   // both what was refused and what a human waved through.
   | {

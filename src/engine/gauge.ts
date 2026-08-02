@@ -69,6 +69,12 @@ export interface LiveUsage extends UsageWindows {
 export interface FileUsage extends UsageWindows {
   fetchedAtMs: number | null;
   ageMs: number | null;
+  /**
+   * Whether this account keeps going past its plan limit on paid credits. Null is "the file does
+   * not say", which is neither enabled nor disabled: S4 found the two accounts on this machine have
+   * different `extra_usage` shapes, so an unreadable block must not be read as "it will just stop".
+   */
+  extraUsageEnabled: boolean | null;
 }
 
 /** Layer 1. Returns null for "no reading" on absolutely anything unexpected. */
@@ -145,11 +151,17 @@ export function readOfficialFile(configDir: string, now: number = Date.now()): F
           : 'fresh';
 
   const utilization = block['utilization'];
-  if (!isRecord(utilization)) return { fetchedAtMs, ageMs, fiveHour: ABSENT_READING, weekly: ABSENT_READING };
+  if (!isRecord(utilization)) {
+    return { fetchedAtMs, ageMs, extraUsageEnabled: null, fiveHour: ABSENT_READING, weekly: ABSENT_READING };
+  }
+
+  const extra = utilization['extra_usage'];
+  const enabledRaw = isRecord(extra) ? extra['is_enabled'] : undefined;
 
   return {
     fetchedAtMs,
     ageMs,
+    extraUsageEnabled: typeof enabledRaw === 'boolean' ? enabledRaw : null,
     fiveHour: windowReading(utilization['five_hour'], 'official_file', confidence),
     weekly: windowReading(utilization['seven_day'], 'official_file', confidence),
   };
@@ -282,6 +294,25 @@ export class Gauge {
 
   get contextPeakPercent(): number | null {
     return this.contextPeak;
+  }
+
+  /**
+   * Whether this account spends money past its plan limit, or null when the file will not say.
+   * Read from the file layer only: the live probe carries the same block but is not always there,
+   * and a hard rail that only exists while a session is running is not a rail.
+   */
+  get extraUsageEnabled(): boolean | null {
+    return this.file?.extraUsageEnabled ?? null;
+  }
+
+  /** The highest-trust reading for a window, for callers outside the gauge. Read only. */
+  readingFor(window: keyof UsageWindows): Reading {
+    return this.pick(window);
+  }
+
+  /** Re-reads the cheap file layer without logging. Used when a pause re-checks where it stands. */
+  refreshFile(): void {
+    this.file = readOfficialFile(this.configDir);
   }
 
   /** Tokens metered inside a rolling window. The window is the honest unit; the all-time sum is not. */
@@ -597,6 +628,45 @@ function round(value: number): number {
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+/** The two windows the pause primitive can bind on, named the way the logbook names them. */
+export type WindowId = 'session_5h' | 'weekly_all';
+
+export function windowIdFor(window: keyof UsageWindows): WindowId {
+  return window === 'fiveHour' ? 'session_5h' : 'weekly_all';
+}
+
+/** A reading solid enough to stop work on, with the moment it stops being true. */
+export interface UsableReading {
+  window: WindowId;
+  percent: number;
+  resetsAt: string;
+  resetsAtMs: number;
+}
+
+/**
+ * Is this reading good enough to idle Conductor on? Three tests, and all three come from things
+ * that already went wrong once.
+ *
+ * A percentage with no reset time cannot say when a pause would end, so it can only produce a wait
+ * with no stated finish. A reading that is not fresh is the S2 staleness problem: SDK sessions
+ * never refresh the file, so a percentage can describe a window that ended hours ago. And a reading
+ * whose own `resets_at` has already passed is the second freshness test from the decisions log,
+ * learned live at 12:22 UTC on 2026-08-01 when a 51-minute-old file still read 100% for a window
+ * that had reset two minutes earlier. Checking age alone would have idled a full tank for hours.
+ *
+ * Null means "do not pause on this". Not pausing is the safe direction here: the worst case is that
+ * a task runs and the account stops it, which costs one wasted start. The other direction costs
+ * hours of a working machine doing nothing, which is the failure the whole feature exists to
+ * measure rather than to cause.
+ */
+export function usableForPause(window: keyof UsageWindows, reading: Reading, now: number = Date.now()): UsableReading | null {
+  if (reading.percent === null || reading.resetsAt === null) return null;
+  if (reading.confidence !== 'fresh') return null;
+  const resetsAtMs = Date.parse(reading.resetsAt);
+  if (!Number.isFinite(resetsAtMs) || resetsAtMs <= now) return null;
+  return { window: windowIdFor(window), percent: reading.percent, resetsAt: reading.resetsAt, resetsAtMs };
 }
 
 export function formatTokens(total: number): string {

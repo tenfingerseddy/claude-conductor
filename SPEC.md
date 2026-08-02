@@ -1,6 +1,9 @@
 # Conductor, a self-managing harness for Claude
 
-Working name: **Conductor**. Placeholder, rename freely. Revision 5, 2026-08-02: tasks work in
+Working name: **Conductor**. Placeholder, rename freely. Revision 6, 2026-08-02: the gauge measures
+lost time, because a pause for a usage limit is now a logged event carrying what it cost and what
+the other accounts held, so a decision to add an account rests on measured numbers. Revision 5,
+2026-08-02: tasks work in
 their own isolated copy of a project, replacing the checkpoint-and-undo model, because two rounds
 of adversarial review showed that comparing a live folder before and after proves timing rather
 than authorship and would destroy the human's concurrent work. Revision 4, 2026-08-01: revision 3
@@ -193,6 +196,33 @@ Sources, in order of trust:
 Wording rule for the injected line: calm, no countdown alarm. Include a standing sentence that
 there is ample room to finish the current step, because models told they are near a limit can
 panic and wrap up early.
+
+#### Lost time
+
+Goal 2 says limits must never halt progress. Sometimes they do anyway, and when they do the halt is
+measured rather than merely endured. Above a threshold written in the playbook, a queued task does
+not start: the service waits for the binding window to reset, then looks again. Each wait writes
+two lines to the logbook. The pause names the account, the window, where it stood, when it resets,
+why it fired, how many tasks are behind it, and what every other account's tank read at that
+moment. The resume names what the wait actually cost in wall clock against what it was predicted to
+cost, and whether it was cut short.
+
+That pairing is the whole point, and it exists because the decision it feeds is a spending decision.
+Adding an account costs money and the argument for it should be a number, not a feeling that things
+sometimes stall. So `lost-time` reports, per account and in total, how often work stopped, how long
+for, the longest single wait, and how much of that time another account had room to spare. Each of
+those claims is bounded in writing: the other-account readings are file reads taken at pause start
+and the file layer goes stale, so the recoverable share is an indication and says so. A pause whose
+end was never recorded is counted and listed by name and contributes no time at all, because a
+total that quietly includes invented minutes is worth less than one with a footnote.
+
+Two rails sit on the same mechanism. Crossing from plan usage into paid extra-usage credits fires
+the pause at the plan limit regardless of the threshold, since past that line the account spends
+real money instead of stopping. And a pause needs a reading it can stand on: if the gauge cannot say
+where the window sits, because there is no reading, the reading is stale, or its own reset time has
+already passed, nothing is paused. That case is logged too. A gauge that idles a full tank on a
+guess is a worse failure than one that starts a task the account then refuses, and it is the failure
+this project has already met once by hand.
 
 ### Playbook
 

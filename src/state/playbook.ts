@@ -34,6 +34,8 @@ These are not advice. Conductor enforces them and a human tap is the only way pa
 
 - Above 70% of the 5-hour window: subagents drop to Sonnet at medium effort, and Fable work goes
   in the queue instead of starting now.
+- pause threshold: 95%. At or above this on the window that is binding, no new task starts; the
+  service waits for that window to reset and logs what the wait cost.
 - Heavy tasks wait for a reset. Light useful work mops up headroom that would otherwise expire.
 - Starting a session costs real tokens before a word is said. Do not cut for the sake of cutting.
 - The gauge number is mostly self-metered, so treat it as a good estimate, not a meter reading.
@@ -62,4 +64,29 @@ export function readPlaybook(config: Config): string {
     process.stderr.write(`conductor: could not read playbook at "${config.playbookPath}": ${String(err)}\n`);
     return '';
   }
+}
+
+/**
+ * The point at which a new task stops starting and waits for the window to reset.
+ *
+ * 95 rather than a rounder number, and it is a ladder rather than a guess. The gauge already
+ * carries two rungs below it: WINDOW_CHECKPOINT_PERCENT at 70, where the playbook drops subagents
+ * to a cheaper model and queues the expensive work, and the seeded hard rail at 85, where Fable
+ * work stops starting. A pause is the last rung, so it sits above both and below 100, which is
+ * where the account either stops on its own or starts spending money. Anything lower would idle a
+ * tank the earlier rungs are already there to protect.
+ */
+export const DEFAULT_PAUSE_THRESHOLD_PERCENT = 95;
+
+/**
+ * Reads `pause threshold: N%` out of the playbook, leniently, because the playbook is a page a
+ * human writes in plain language and not a config file. Any spacing, an optional percent sign, a
+ * decimal, and any surrounding prose on the line are all fine. Anything else, including a number
+ * outside 1 to 100, falls back to the default rather than failing: a policy page with a typo in it
+ * must not decide that every task is allowed to run into a wall, nor that none may start.
+ */
+export function readPauseThreshold(config: Config): number {
+  const match = /pause\s+threshold\s*[:=]\s*(\d{1,3}(?:\.\d+)?)\s*%?/i.exec(readPlaybook(config));
+  const parsed = match?.[1] === undefined ? NaN : Number(match[1]);
+  return Number.isFinite(parsed) && parsed > 0 && parsed <= 100 ? parsed : DEFAULT_PAUSE_THRESHOLD_PERCENT;
 }
