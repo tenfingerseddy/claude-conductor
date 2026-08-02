@@ -2,12 +2,15 @@
 
 ## State of play, 2026-08-02
 
-**Isolation is built, reviewed and awaiting Kane's merge call.** The branch is
-`feat/m2-isolation`, six commits from `main`. `src/engine/isolation.ts` gives each task its own
-git worktree of the user's repo, made from a named commit, on branch `conductor/task-<id>`, under
-Conductor's state root. The output is a branch to review and merge; undo is discarding the copy.
-Nothing is wired in yet, and `checkpoint.ts` is untouched; its removal belongs to the wiring
-slice. Full review record: `docs/notes/sol-review-m2-isolation.md`.
+**Isolation is built, wired, reviewed and merged to main.** `src/engine/isolation.ts` gives each
+task its own git worktree of the user's repo, made from a named commit, on branch
+`conductor/task-<id>`, under Conductor's state root. The task loop runs sessions in the copy's
+workdir, seals the work onto the branch at task end, and the undo door discards the copy behind a
+preview-then-confirm token. `checkpoint.ts` is deleted. Review records:
+`docs/notes/sol-review-m2-isolation.md` (the module, six passes) and
+`docs/notes/sol-review-m2-wiring.md` (the wiring, one blocker found and closed). Merged under the
+D3 grant, Sol review plus demonstrated run, both on record; Kane can revert if this call was meant
+to be his alone.
 
 **The review arc, in one paragraph.** Six Sol passes, five fix rounds, 19 real defects found and
 fixed, each fix proven by a reproduction that fails against the prior commit and passes against
@@ -22,10 +25,9 @@ answer it would not give as "unknown", never as "no".
 its three reviews. Kept as the evidence that in-place undo could not be made safe. That branch
 does not merge.
 
-**Next, in order:** wire isolation into the task loop and doors (createWorkspace before the
-session, session cwd = the copy's workdir, seal at task end, discard as the undo verb, checkpoint
-code deleted); then slice B, place enforcement, which is now mostly "the task may only write
-inside its worktree", a filesystem fact; then slice C, the permissive default.
+**Next, in order:** slice B, place enforcement, which is now mostly "the task may only write
+inside its worktree", a filesystem fact; then slice C, the permissive default; then the durable
+queue with pacing, the inbox, the notebook and subagent account routing.
 
 **Waiting on Kane, neither blocking:** whether a refusal fallback should quietly restore the model
 or stop and say so; and two opening-round decisions that were picks from an AI-framed menu rather
@@ -111,8 +113,8 @@ Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says wh
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 complete, M1 merged to main. M2 isolation built and reviewed on `feat/m2-isolation`,
-awaiting Kane's merge call.** Last updated 2026-08-02.
+Status: **M0 and M1 complete. M2 isolation merged to main. Slice B, place enforcement, is next.**
+Last updated 2026-08-02.
 
 ## How to read this file
 
@@ -704,7 +706,7 @@ is the code; `docs/notes/sol-review-m2-isolation.md` is the whole review record.
       and CLI on a dirty scratch repo, user folder byte-identical across run and undo on all four
       measures, seal commit with the exact expected file list, rail taps unchanged, autonomous still
       refused.
-- [ ] Kane's merge call on the branch.
+- [x] Merged to main 2026-08-02 under the D3 grant (Sol review plus demonstrated run, both on record). Kane can revert if the call was meant to be his alone this time.
 - Evidence: `spikes/isolation/verify.ts`, 205 checks green, re-run whole after every round; each
   fix round's findings file under `docs/notes/m2-isolation-*.md` shows its reproductions failing
   against the prior commit. The architect re-ran typecheck and the full spike independently after
