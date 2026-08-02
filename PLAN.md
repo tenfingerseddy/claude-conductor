@@ -696,9 +696,15 @@ is the code; `docs/notes/sol-review-m2-isolation.md` is the whole review record.
       branch recreation race (loss is a name, not work), assume-unchanged/skip-worktree invisibility,
       the labels-versus-tree moment-of-observation race, and pass 6's items requiring git to violate
       its own --format contract (all fail toward leaving things alone).
-- [ ] Kane's merge call, then the wiring slice: task loop uses createWorkspace/seal, session cwd
-      becomes the copy's workdir, undo door becomes discard, `checkpoint.ts` and its server surface
-      deleted.
+- [x] The wiring slice (commit `f39009b`): the task loop uses createWorkspace/seal, the session cwd
+      is the copy's workdir so every path check scopes to the copy, the undo door is discard with an
+      explicit confirm bound to the taskId, `describeWorkspace` rides on task start, and
+      `checkpoint.ts` plus its five logbook kinds are deleted, with old logbook lines verified to
+      still read. Evidence: `docs/notes/m2-wiring-findings.md`, a real Haiku task through the daemon
+      and CLI on a dirty scratch repo, user folder byte-identical across run and undo on all four
+      measures, seal commit with the exact expected file list, rail taps unchanged, autonomous still
+      refused.
+- [ ] Kane's merge call on the branch.
 - Evidence: `spikes/isolation/verify.ts`, 205 checks green, re-run whole after every round; each
   fix round's findings file under `docs/notes/m2-isolation-*.md` shows its reproductions failing
   against the prior commit. The architect re-ran typecheck and the full spike independently after
