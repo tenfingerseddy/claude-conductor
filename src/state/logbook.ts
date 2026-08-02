@@ -19,7 +19,19 @@ export interface TokenUsage {
 export type ConductorEvent =
   | { kind: 'daemon_start'; pid: number; stateRoot: string; version: string; accounts: number }
   | { kind: 'daemon_stop'; pid: number; reason: string }
-  | { kind: 'task_start'; taskId: string; account: string; model?: string; effort?: string; cwd?: string }
+  | {
+      kind: 'task_start';
+      taskId: string;
+      account: string;
+      model?: string;
+      effort?: string;
+      /** The folder the human named. The session never runs here; see workdir. */
+      cwd?: string;
+      /** Where the session actually ran: the isolated copy's counterpart of cwd. */
+      workdir?: string;
+      /** The branch the copy's work lands on, so a reader can find the output from this line alone. */
+      branch?: string;
+    }
   | {
       kind: 'task_finish';
       taskId: string;
@@ -29,6 +41,48 @@ export type ConductorEvent =
       usage?: TokenUsage;
     }
   | { kind: 'cut'; taskId: string; mode: 'fresh' | 'compact'; sessionId?: string; reason?: string }
+  // --- isolation (M2 slice A-prime) ------------------------------------------
+  //
+  // These replace the checkpoint kinds this file used to carry (`checkpoint`, `checkpoint_refused`,
+  // `postimage`, `postimage_failed` and `undo`), deleted with src/engine/checkpoint.ts when tasks
+  // moved into their own copy. An events.jsonl written before that still holds those lines, and
+  // every reader here tolerates a kind it does not know: findWorkspace skips non-matching kinds,
+  // the daemon's /events and `conductor tail` pass whole lines through without inspecting kind.
+  // A task's own copy of a project. This line is also how undo finds the copy again later, which is
+  // why it carries the repo root, the branch and the worktree path and not only the task id.
+  | {
+      kind: 'workspace_created';
+      taskId: string;
+      repoRoot: string;
+      /** The commit the copy was made from. Named, so "what did this start from" is never a guess. */
+      baseCommit: string;
+      /** Where the user's HEAD pointed. Null when it was detached. Recorded, never moved. */
+      baseRef: string | null;
+      branch: string;
+      worktreePath: string;
+      /** The task cwd relative to the repo root, '/'-separated. Empty when it is the root. */
+      relPath: string;
+      workdir: string;
+      /**
+       * What the copy lacks, counted in the user's folder at creation time. Null when the count
+       * could not be taken: a failed `git status` must never be logged as a clean folder.
+       */
+      modifiedTracked: number | null;
+      untracked: number | null;
+      workdirCreated: boolean;
+      /** True when the user's HEAD moved between reading it and the copy existing. */
+      headMovedDuringCreate: boolean;
+    }
+  // No copy was made, so no task ran. Logged as loudly as a creation: there is no fallback to
+  // running in the user's folder, so this line is the whole story of why nothing happened.
+  | { kind: 'workspace_refused'; taskId: string; cwd: string; reason: string }
+  // The task's work committed on its own branch. committed:false means the task changed nothing.
+  | { kind: 'workspace_sealed'; taskId: string; branch: string; commit: string; committed: boolean; files: number }
+  | { kind: 'workspace_seal_failed'; taskId: string; branch: string; reason: string }
+  // Undo. ok:false means the copy is still on disk and the branch was left alone.
+  // `note` records something deliberately left alone, such as a branch of the right name that git's
+  // metadata could not confirm was Conductor's.
+  | { kind: 'workspace_discarded'; taskId: string; branch: string; worktreePath: string; ok: boolean; reason?: string; note?: string }
   | {
       kind: 'gauge_reading';
       account: string;

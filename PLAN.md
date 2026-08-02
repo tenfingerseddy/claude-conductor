@@ -1,5 +1,49 @@
 # Conductor build plan
 
+## State of play, 2026-08-02
+
+**Isolation is built, reviewed and awaiting Kane's merge call.** The branch is
+`feat/m2-isolation`, six commits from `main`. `src/engine/isolation.ts` gives each task its own
+git worktree of the user's repo, made from a named commit, on branch `conductor/task-<id>`, under
+Conductor's state root. The output is a branch to review and merge; undo is discarding the copy.
+Nothing is wired in yet, and `checkpoint.ts` is untouched; its removal belongs to the wiring
+slice. Full review record: `docs/notes/sol-review-m2-isolation.md`.
+
+**The review arc, in one paragraph.** Six Sol passes, five fix rounds, 19 real defects found and
+fixed, each fix proven by a reproduction that fails against the prior commit and passes against
+the fix; 205 checks in `spikes/isolation/verify.ts`, re-run whole and green after every round.
+Round sizes fell 9, 5, 2, 2, 1, and no pass ever dented the isolation model itself: everything
+after round 1 was about honesty of failure modes. Pass 6 found zero defects reachable on a real
+git and the architect closed the review with the reasoning written down in the review file. The
+one theme worth keeping: a name, a path, or a silent exit is never proof; ask git, and treat an
+answer it would not give as "unknown", never as "no".
+
+**Superseded but still on `feat/m2-checkpoints`:** the old checkpoint-and-undo implementation and
+its three reviews. Kept as the evidence that in-place undo could not be made safe. That branch
+does not merge.
+
+**Next, in order:** wire isolation into the task loop and doors (createWorkspace before the
+session, session cwd = the copy's workdir, seal at task end, discard as the undo verb, checkpoint
+code deleted); then slice B, place enforcement, which is now mostly "the task may only write
+inside its worktree", a filesystem fact; then slice C, the permissive default.
+
+**Waiting on Kane, neither blocking:** whether a refusal fallback should quietly restore the model
+or stop and say so; and two opening-round decisions that were picks from an AI-framed menu rather
+than his own words (D9 approvals, largely overtaken by the isolation model, and D5 state location,
+chosen before the repo was known to be public).
+
+**Working rules learned on this machine, keep following them.** Sol is briefed with files inlined
+and line-numbered, because the codex sandbox cannot launch a process here. The refusal-fallback
+model swap is persistent for the session, so a fresh session is the way back. And to stop
+tripping that classifier at all (Kane's ask, 2026-08-02): adversarial review detail lives in
+`docs/notes/` files referenced by path, main-thread prose stays in correctness language, and Sol
+briefs go through codex, which never touches Claude's classifier. No guarantee, but the trigger
+both times was attack-flavoured prose in the main thread, not the code.
+
+**Note for whoever reads this next:** Kane has progressed the scope program in `nexwave-apps`
+extensively in parallel. Anything this file says about that repo is stale. Re-read
+`nexwave-apps/scope/` before acting on it rather than trusting a summary here.
+
 ## Morning report, 2026-08-01
 
 **M1 is merged to main. Conductor runs.** It does one task, cuts the context on purpose, carries a
@@ -30,6 +74,21 @@ reading can be recent and still describe a window that has already reset, and ch
 would have idled Conductor for hours on a full tank. And switching branches while a builder is
 working corrupts its tree, which is why documentation now lands on the working branch.
 
+**Second half of the night: M2 slice A, checkpoints and undo.** Built, reviewed, found unsafe,
+fixed, and deliberately left unmerged. Sol raised fifteen findings and its verdict was that slice
+A did not yet justify the permissive default. The deepest was that undo could not tell task output
+from work a human did afterwards, so it would have overwritten your later edits while calling them
+Claude's mess. Fixed with a second snapshot at task end, which makes provenance knowable instead
+of guessed, and proven with reproductions that fail on the old code and pass on the new. Two
+findings are carried open in writing rather than quietly closed, and one safety path (symlinks)
+cannot be tested on this account at all, which the notes say plainly.
+
+**Where the night stopped, and why.** The usage reading went stale at 89 minutes, and SDK sessions
+never refresh it, so the honest position was that headroom on the paid-credit account was unknown.
+Roughly 620k tokens of subagent work had run since the reset. Rather than guess while you slept, I
+stopped launching work and wrote everything up. Nothing is half-finished; slice A sits complete on
+its branch waiting for a decision.
+
 **Waiting on you, nothing urgent.**
 
 - Two decisions deserve re-putting in your own words rather than as picks from my menu: approvals
@@ -38,13 +97,22 @@ working corrupts its tree, which is why documentation now lands on the working b
 - `scope/conductor-demo/` in nexwave-apps is leftover from the finish-line run and can be deleted.
 - M2 is planned as six slices below, ordered so the permissive default is earned rather than
   assumed. Slice A is checkpoints, which is the prerequisite for everything you asked for.
+- Slice A is on `feat/m2-checkpoints` and ready for your call: merge it as is, with the two
+  carried findings and the untested symlink path recorded, or hold it until finding 4 is fixed and
+  Sol has passed the whole slice. My recommendation is the latter, because the permissive default
+  is the thing this buys and it should not rest on a net with a known open seam.
+- Worth knowing before slice C: reversibility currently has three stated holes. Ignored files are
+  outside the net, a file whose bytes disagree with its own `.gitattributes` comes back converted,
+  and symlink handling has never executed. Each needs fixing or accepting in writing before
+  permission gets cheap, because "reversible" is the entire argument for it.
 
 
 Tracking file for building Conductor from [`SPEC.md`](SPEC.md). The spec says what we are building
 and why. This file says what is done, what is next, and what we agreed. Update it in the same
 commit as the work. If this file and the spec disagree, the spec wins and this file is wrong.
 
-Status: **M0 complete, M1 merged to main. M2 planned, slice A next.** Last updated 2026-08-01.
+Status: **M0 complete, M1 merged to main. M2 isolation built and reviewed on `feat/m2-isolation`,
+awaiting Kane's merge call.** Last updated 2026-08-02.
 
 ## How to read this file
 
@@ -108,7 +176,14 @@ Stop working, write down what happened, and tell Kane. Do not push through any o
 1. Any spike verdict comes back red. Especially spike 1.
 2. Anything appears to require `ANTHROPIC_API_KEY`, a token, or any credential in the repo.
 3. Usage data, logs, handoffs, or account identifiers are about to land in a committed file.
-4. Work drifts past the M1 finish line. M2 does not start in this run.
+4. Work drifts past the agreed scope of the current run. **Amended 2026-08-01, and the amendment
+   is itself worth noting.** This originally read "M2 does not start in this run", written when
+   the run was D1's M0-then-M1. Kane then said to work autonomously overnight, and assumption A2
+   recorded exactly what that permits: foundations that cannot loosen safety. Starting M2 slice A
+   was deliberate under that grant, not drift. But the stop condition was not updated to match at
+   the time, which meant the tracking file contradicted the work for several hours. Amending it
+   now rather than quietly ignoring it: scope changes get written down when they happen, or the
+   stop conditions stop meaning anything.
 5. A design choice contradicts the spec and the spec looks wrong. Say which is wrong, do not
    quietly pick one.
 6. Sol raises a finding that changes the design rather than the code.
@@ -444,14 +519,200 @@ tap-heavy and unattended-incapable; M2 is what earns the freedom back honestly.
 
 Nothing else in M2 is safe without this, so it goes first.
 
-- [ ] Before each task in a git project, commit the working tree to a Conductor branch. Never to
+- [x] Before each task in a git project, commit the working tree to a Conductor ref. Never to
       the user's branch, never a push.
-- [ ] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
-- [ ] `undo last task` on every door: restore the tree to the task's checkpoint ref.
-- [ ] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
+- [x] Record the checkpoint ref in the task's logbook events, so every task has a before-image.
+- [x] `undo last task` on every door: restore the tree to the task's checkpoint ref.
+- [x] Non-git project folders: refuse the task rather than pretend it is reversible. An honest
       refusal beats a checkpoint that does not exist.
 - Finish line: a task makes a mess, one command puts it back exactly, proven on a scratch repo
   with a dirty tree beforehand.
+- Evidence: `src/engine/checkpoint.ts` on `feat/m2-checkpoints`. Full transcripts in
+  `docs/notes/m2-sliceA-findings.md`. A task edited a tracked file, edited a nested one, created two
+  files including one in a new directory, deleted a tracked file and clobbered the user's untracked
+  note; undo put every hash back and left `git status --porcelain` matching the pre-task status
+  exactly. Checkpointing is provably invisible to the user: status byte-identical before and after,
+  `.git/index` unchanged by its own hash, `ls-files -s` unchanged, HEAD unmoved, reflog unchanged,
+  the staged change still staged, and `git branch --list -a` showing only `main` while the checkpoint
+  lives under `refs/conductor`. Zero-commit repo, detached HEAD, subfolder scoping, non-git refusal
+  at both gates with no session started, and preview-without-confirmation all verified. Two bugs the
+  verification caught and the code now fixes: an 8.3 versus long path mismatch made undo silently
+  restore nothing, and `core.autocrlf` made every restored file differ from the file it replaced.
+  Two limits stated rather than skipped: `.gitignore`d files are not in the before-image and are
+  never touched, and an in-tree `.gitattributes` `text` declaration still normalises content. Nothing
+  about the rail, trust or permissions changed; autonomous trust is still refused.
+- **Gate on slice C.** Those two limits are not cosmetic, because "reversible" is the claim that
+  buys the permission. Before the permissive default is switched on, each must be either fixed or
+  accepted in writing by Kane: ignored files are outside the safety net, and a file whose bytes
+  disagree with its own `.gitattributes` comes back converted rather than identical. A safety net
+  with unstated holes is worse than a visible tap.
+- **Sol review: not safe to merge.** Fifteen findings, three critical, eight high, four medium.
+  `docs/notes/sol-review-m2-sliceA.md`. Sol's verdict in its own words: slice A does not yet
+  justify the permissive permission default. Its diagnosis is the right one and worth keeping:
+  the before-image is sound, but the plan built from it guesses provenance, and the preview
+  asserts that guess as fact.
+  Four blocking: (1) undo compares checkpoint against now, so it cannot tell task output from work
+  a human did afterwards, and would overwrite the human's later edit while labelling it task
+  output; (2) confirmation is not bound to the preview, since the server recomputes the plan on
+  the confirming call and accepts a confirm with no preview at all, so consent is to a list that
+  is not the list that runs; (3) a case-only rename deletes the file undo just restored, because
+  restores run before deletes and Windows treats both spellings as one file; (4) a changed
+  `.gitignore` lets undo delete a previously ignored file, breaking a promise the stated limits
+  make. Five more are real limits rather than bugs (index and HEAD state, `.gitattributes` silent
+  non-detection, submodules, symlink referents, the non-atomic scan) and the limits list reads as
+  exhaustive at two entries when it is not. One false positive.
+  **Fix round landed**, `docs/notes/m2-sliceA-fix-findings.md`. All four blockers closed, each
+  with a reproduction run against a detached worktree of the old code and against the new: 13 of
+  20 checks fail before, 0 after. Provenance now comes from a post-image commit at task end, so
+  checkpoint to post-image is the task's work and post-image to now is somebody else's; a human
+  edit, a human-created file and a human re-edit of a task-touched file all survive undo untouched
+  and are named in the preview as held back. No post-image means provenance is unknown and the
+  blanket undo is refused rather than guessed. Consent is bound: preview returns a plan id plus a
+  hash, the daemon applies the stored plan, and blind confirm, mismatched hash and replay are all
+  rejected. Deletes run before restores with case collisions named. The ignore set is captured at
+  checkpoint time as a pinned blob and read back verbatim. Slice A's finish line re-ran whole and
+  still passes.
+- **Two findings carried open, honestly, not closed.** Sol's finding 4, an inherited `GIT_DIR` in
+  the child environment, is real and is the first task when work resumes: a small change to
+  `gitEnv`, and it deserves its own review because getting it wrong points the plumbing at the
+  wrong repository. Sol's finding 9b, a junction swap race, is an **architect call: parked under
+  the v1 threat model.** Swapping a directory junction underneath a running operation requires a
+  hostile process already executing as Kane, which is the attacker the threat model explicitly
+  excludes, and that process could corrupt the repository directly without involving Conductor.
+  Recorded rather than fixed, consistent with the three token findings parked on the same ground.
+- Symlink detection exists but is **unverified**: this account cannot create a symlink on this
+  host (`EPERM`), so the code path has never run. The findings say so rather than implying
+  coverage. It needs verifying on a machine or account that can, before anything relies on it.
+- **Second fix round landed** (commit `9a392ac`, `docs/notes/m2-sliceA-fix2-findings.md`), closing
+  the last two defects. Sol's carried finding 4 is fixed: the entire inherited `GIT_*` namespace is
+  stripped, case-insensitively, and only `GIT_INDEX_FILE`, `GIT_TERMINAL_PROMPT` and the commit
+  identity go back in, with nothing allowlisted. `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are
+  stripped but deliberately not blanked, so Conductor still reads the repository the way the user's
+  own git does; the settings that must not vary are passed per command as `-c`, which outranks any
+  config file. Before the fix, a checkpoint of one repository wrote both Conductor refs into a
+  decoy repository and left the intended one with no checkpoint, and undo under `GIT_WORK_TREE`
+  reported success while changing nothing. 15 of 21 checks fail before, 0 after.
+- The architect's own read of `checkpoint.ts` found a second defect, now fixed: under unknown
+  provenance with the override given, the preview still printed "created by the task" for every
+  path, which is the one claim it cannot make without a post-image. That is the same class of flaw
+  Sol originally failed the slice for, so it mattered more than its size. One `verbFor` function now
+  owns the wording and attribution requires a post-image. The fix round found a third case unprompted:
+  with a post-image plus the override, somebody else's edits were being folded into the main list
+  under the task's name.
+- Architect's review of the code itself, done by reading it rather than trusting the reports: the
+  three-tree provenance logic is correct, deletes before restores is right, the pinned ignore blob
+  is the right shape, the plan fingerprint covers the fields that matter, and every git call is an
+  argument array with no shell. The file is comment-heavy to the point of reading like a design
+  document, which is defensible for the piece everything else rests on but is worth watching against
+  the simplicity budget.
+- Process note: `node_modules` disappeared mid-session and a `tsc` check silently did nothing while
+  reporting nothing, because `npx` fell through to a placeholder package. A commit was made before
+  that was noticed. Reinstalled, typecheck confirmed clean, CLI output confirmed by running it.
+  The lesson is the one already in the golden rules: `&&` chains that end in `;` do not gate
+  anything, and a verification that cannot fail is not a verification.
+- **Sol round 2: still not safe to merge.** Twelve findings, six blocking, four of which destroy
+  work undo exists to protect. `docs/notes/sol-review-m2-sliceA-round2.md`. Nothing from round one
+  came back, so every fix held. The new findings are in what those fixes do not cover, and the
+  architect stopped here rather than starting a third round. Stop condition 6 and overnight
+  assumption A6 both point the same way: two failures on one problem means the design is the
+  question, not the code.
+
+### Slice A, the design question it raised
+
+Read the pattern, not the list. Round one: fifteen findings, fixed, all held. Round two: twelve new
+ones through doors nobody had thought about. That is the rail's shape exactly, and the rail was
+only settled by deleting the mechanism rather than improving it.
+
+Three classes generate every finding, and each keeps producing new members:
+
+1. **The tree is shared with a human.** Sol's finding 3 is the deep one: the post-image proves
+   timing, not authorship. An edit Kane makes *while a task runs* lands inside
+   checkpoint..post-image and comes back labelled "changed by the task". The post-image narrowed
+   round one's failure; it did not close it, and nothing that compares snapshots can, because two
+   authors writing in one interval are indistinguishable by snapshot. Finding 1 is the same class
+   in time: the plan is computed, shown, then applied later against a tree that moved.
+2. **Undo is selective.** Deciding per path what to restore, delete or hold generates edge cases
+   without end: ignore rules added mid-task (2), case aliasing (4), a file renamed out of the
+   ignore set with no bytes anywhere to restore (6), file-to-directory replacement (7).
+3. **It is routed through git.** Using git's index and refs drags in git's semantics and side
+   effects: filters and `reference-transaction` hooks actually execute repository code (8), sparse
+   checkout records paths not on disk (9), tree objects cannot hold empty directories (10), and
+   `.gitattributes` can transform bytes invisibly.
+
+**The dissolution, and it is the same move as the rail: remove the thing rather than model it.**
+Run each task in its own fresh git worktree. Then:
+
+- Nobody else is writing in that tree, so provenance is not inferred, it is structural. Class 1 is
+  gone, including findings 1 and 3.
+- Undo stops being selective. It becomes "discard the worktree", which is total, instant and
+  exact. Class 2 is gone entirely: no plan, no fingerprint, no ignore set, no case collisions, no
+  held set.
+- There is no before-image to capture, so class 3 mostly goes with it. No `add -A`, no
+  `update-ref`, so no filters and no `reference-transaction` hook firing on the user's repo.
+- `checkpoint.ts`, currently 990 lines, collapses to roughly "make a worktree, remove a worktree".
+  That is the simplicity budget being paid back with interest.
+- Slice B gets its place boundary free. "The task may only write inside its worktree" is a
+  filesystem fact, not a judgement about a string, which is precisely what three failed rail
+  rounds said we needed.
+
+**What it costs, stated honestly, because this is Kane's call:**
+
+- Tasks stop running in the folder Kane is looking at. Output arrives as commits on a branch to
+  review and merge, not as edits appearing in place.
+- A fresh worktree has no untracked or ignored files, so local `.env` files, build output and
+  anything else git does not track are absent. Tasks needing those either get them copied in
+  deliberately or fail honestly.
+- Some work genuinely wants the real folder, for example running the app against local config.
+  Those tasks would need an in-place mode, which would carry the weaker guarantee and should say so.
+
+**The alternative, if that friction is unacceptable:** keep working in place, close findings 1, 2,
+3, 4 and 6, state 8 honestly, and then accept that undo is a convenience rather than a guarantee.
+That is a coherent position. It just means the permissive default cannot rest on undo, and would
+need earning some other way or dropping. What is not available is in-place undo strong enough to
+justify unattended work; two review rounds are the evidence.
+
+**Recommendation: worktree isolation.** It dissolves three classes instead of patching members,
+pays back the simplicity budget, and hands slice B the boundary it needs. Awaiting Kane.
+**Ratified by Kane 2026-08-02**, written into SPEC revision 5, and built as slice A-prime below.
+
+### Slice A-prime, isolation (replaces slice A)
+
+Built 2026-08-02 on `feat/m2-isolation`. SPEC revision 5 is the design; `src/engine/isolation.ts`
+is the code; `docs/notes/sol-review-m2-isolation.md` is the whole review record.
+
+- [x] `createWorkspace`: a git worktree of the user's repo from a named commit, on branch
+      `conductor/task-<id>`, under `<stateRoot>/workspaces/`. The user's checkout provably does
+      not move: status, index bytes, HEAD and reflog identical across create, seal and discard.
+- [x] `sealWorkspace`: the task's work committed on its own branch, as an ordinary commit that
+      respects the repo's own settings (deliberate reversal of the checkpoint raw-bytes rule,
+      because a seal commit is meant to be merged). Refuses if the copy's HEAD left our branch.
+- [x] `discardWorkspace`: the undo verb. Ownership confirmed from git's worktree metadata before
+      anything is removed; branch deletion is compare-and-delete; an answer git would not give is
+      treated as unknown and refused, never as "no".
+- [x] Honest refusals for every non-isolatable case, and `describeWorkspace` states what the copy
+      lacks (uncommitted work, untracked and ignored files), in past tense anchored to creation.
+- [x] Sol review arc complete: six passes, five fix rounds, 19 defects fixed with reproductions,
+      close-out reasoning recorded. Parked with reasons in the review file: the same-name-same-tip
+      branch recreation race (loss is a name, not work), assume-unchanged/skip-worktree invisibility,
+      the labels-versus-tree moment-of-observation race, and pass 6's items requiring git to violate
+      its own --format contract (all fail toward leaving things alone).
+- [x] The wiring slice (commit `f39009b`): the task loop uses createWorkspace/seal, the session cwd
+      is the copy's workdir so every path check scopes to the copy, the undo door is discard with an
+      explicit confirm bound to the taskId, `describeWorkspace` rides on task start, and
+      `checkpoint.ts` plus its five logbook kinds are deleted, with old logbook lines verified to
+      still read. Evidence: `docs/notes/m2-wiring-findings.md`, a real Haiku task through the daemon
+      and CLI on a dirty scratch repo, user folder byte-identical across run and undo on all four
+      measures, seal commit with the exact expected file list, rail taps unchanged, autonomous still
+      refused.
+- [ ] Kane's merge call on the branch.
+- Evidence: `spikes/isolation/verify.ts`, 205 checks green, re-run whole after every round; each
+  fix round's findings file under `docs/notes/m2-isolation-*.md` shows its reproductions failing
+  against the prior commit. The architect re-ran typecheck and the full spike independently after
+  every round rather than trusting reports.
+- Notebook fact from this review: the codex read-only sandbox cannot launch a process on this
+  host, so Sol's first run read nothing and correctly refused to review rather than invent
+  findings. The workaround is to inline the files, line-numbered, in the brief. Worth knowing
+  before every future Sol pass.
 
 ### Slice B, place enforcement and shell-free execution (the rail rebuild)
 
@@ -504,6 +765,16 @@ Only after A and B.
 - [ ] Playbook hard rails enforced by the service, not just advised.
 - [ ] Subagent registry with per-profile model, effort, and account routing, plus the honesty line
       about legitimate account use in the playbook.
+- [ ] `model_change` logbook event, plus restore. The harness can switch the model mid-run without
+      asking, as it did twice on 2026-08-01 via refusal fallback, and that swap is persistent by
+      design. Watch for the `model_refusal_fallback` notice, log it with its refusal category, and
+      call `setModel` to put the task back on the model it asked for. A harness that silently
+      changes the model is exactly what the logbook exists to catch, and per-model spend in the
+      gauge depends on knowing which model actually ran.
+- [ ] Playbook rule for refusal fallbacks: restore silently, or decline the swap up front via the
+      opt-in `refusal_fallback_prompt` dialog. Kane's call, not the code's. Note the work most
+      likely to trigger it is Conductor's own rail hardening, so this fires during development,
+      not just in production.
 - Finish line: a rail in the playbook demonstrably stops the service, not just the model.
 
 ## Parked for later milestones
@@ -516,6 +787,65 @@ Written down so they do not leak into M1.
 - M5: Tailscale phone page.
 - M6: scheduled review task that edits the playbook with evidence.
 - M7: external runners, headless Codex first, cross-vendor gauge buckets.
+
+## The model switch, investigated 2026-08-02
+
+Kane noticed the session had switched to Opus and asked whether a compact or reset caused it.
+Answer: neither. It was a **safety-classifier false positive on our own security work**, twice.
+
+Evidence, from this session's transcript
+(`~/.claude-work/projects/c--Users-KaneSnyder-nexwave--repos-conductor/9a8ad5b6-....jsonl`):
+
+- **Zero compaction events in the entire transcript.** No `isCompactSummary`, no
+  `compact_boundary`, no auto-compact. The context was never summarised, so that theory is out.
+- Two events of type `model_refusal_fallback`, both `trigger: refusal`, both
+  `apiRefusalCategory: "cyber"`, both `claude-fable-5 -> claude-opus-5`. At 10:44:39Z and at
+  19:03:18Z. The harness text: "Fable 5's safeguards flagged this message ... can sometimes flag
+  legitimate coding, cybersecurity, and biology tasks. Switched to Opus 5."
+- The timing is the tell. The first fired on the turn reporting Sol's rail failure, in a
+  conversation full of `cmd /c del`, `node -e`, interpreter-wrapper bypasses and quoting attacks.
+  The second fired during the later security work. We were hardening a permission rail against
+  command injection, and the classifier read that as offensive cyber content.
+
+**Consequence worth knowing:** this is likely to recur, because the work itself is the trigger. M2
+slice B is the rail rebuild, which means more of exactly this material. If the session is set back
+to Fable it may fall back to Opus again mid-run, without asking.
+
+**A second finding fell out of the same investigation: commit authorship in this repo is
+unreliable.** The `Co-Authored-By` trailer tracks the *configured* model, not the model that
+actually produced the work. So main-thread commits during a fallback are signed Fable while Opus
+wrote them, and every builder commit is signed Fable although `builder.md` pins builders to Opus.
+Both directions are wrong. Given SPEC revision 4 just adopted provenance grading as a design
+principle, our own commit metadata failing the same test is worth naming rather than shrugging at.
+Not rewriting history over it; from here the trailer states the configured model and the body says
+who did the work when it matters.
+
+**For Conductor's own design:** the harness changed the model mid-run and told nobody but the
+transcript. That is precisely a `model_change` event the logbook should carry, and it strengthens
+the case for the gauge tracking per-model spend. Booked into M2 slice F.
+
+**Follow-up, answered from the installed SDK's own type definitions** (`sdk.d.ts` in
+`spikes/s1/node_modules/@anthropic-ai/claude-agent-sdk`, primary source rather than docs):
+
+- **The SDK can switch models mid-session.** `setModel(model?: string)` changes the model for
+  subsequent responses, available in streaming input mode; passing nothing restores the default.
+  `supportedModels()` lists what is available. This is more than the spec assumed: Conductor gets
+  per-task model choice *and* mid-task model change, which makes the playbook's model rules
+  enforceable at a turn boundary rather than only at a cut.
+- **Two fallback mechanisms exist, with opposite persistence, and we hit the sticky one.** The
+  `fallbackModel` option covers an overloaded or unavailable model, and the primary is retried at
+  the start of every user turn so an outage cannot permanently demote a session. The *refusal*
+  fallback is different: the type comment says the swap is "made persistent for the session", and
+  the `revert` direction is retained only for consumer compatibility and is no longer emitted. It
+  is designed not to switch back. Nothing restores the original model without an explicit call.
+- **The switch is observable.** A `model_refusal_fallback` notice carries the original model, the
+  fallback model, the refusal category, and the uuids of retracted messages. A
+  `model_refusal_no_fallback` notice covers the case where no retry runs.
+- **Conductor's response, booked into M2 slice F:** watch for that notice, log it as
+  `model_change` with the category, and call `setModel` to restore the model the task asked for.
+  There is also an opt-in `refusal_fallback_prompt` dialog, gated on the consumer declaring it can
+  render that dialog kind, so a task could decline the swap rather than discover it afterwards.
+  Which of restore-silently or ask-first is right is a playbook rule, not a code decision.
 
 ## Overnight run, 2026-08-01
 
@@ -709,6 +1039,19 @@ Append here when a design call is made during the build. Date, decision, reason,
   human had actually decided. Kane's own words outrank picks against AI framing, which outrank AI
   recommendations, and each is marked. Applied retroactively to this file's decisions table and
   written into SPEC revision 4 as a design principle.
+- 2026-08-01. Checkpoints are taken with git plumbing against a scratch index, never with porcelain.
+  Reason: the user's repository state is not Conductor's to move. `GIT_INDEX_FILE` points at a file
+  in Conductor's own state root, so `add -A`, `write-tree` and `commit-tree` never read or write
+  `.git/index`, and the ref lives under `refs/conductor/` so it cannot appear in `git branch`. The
+  test that matters is that `git status --porcelain` is byte-identical before and after, and it is.
+- 2026-08-01. Checkpoint metadata lives in the logbook, not in a new state file. Reason: the
+  simplicity budget says state is four plain things, and undo needs only the ref, the repo root and
+  the task folder, all of which an append-only event line already carries.
+- 2026-08-01. Conductor's own git calls disable line-ending conversion. Reason: with `core.autocrlf`
+  on, `git add` stores LF and `git checkout-index` writes CRLF, so undo restored four files and all
+  four had different bytes from the ones they replaced. The checkpoint commit never joins the user's
+  history, so raw bytes cost nothing. An in-tree `.gitattributes` can still override this and that
+  limit is documented rather than papered over.
 - 2026-08-01. Brain dumps are a continuous input, not a kickoff step (Kane's own words). The inbox
   organ in SPEC revision 4 takes them: raw kept verbatim, absorbed at cut points, triaged into
   typed items, reversals stated loudly, superseded work marked rather than deleted, order

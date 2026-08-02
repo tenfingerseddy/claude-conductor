@@ -20,6 +20,10 @@ const USAGE = `conductor <command>
        [--account <name>] [--model <model>] [--title <text>]
                                every task is attended: --trust autonomous is refused until M2
   run                          start working the pending list
+  undo [taskId] [--yes]        discard the task's own copy: delete the worktree and its branch
+                               without --yes it only describes the copy and what would go.
+                               Your own folder is never touched either way, because the task
+                               never worked in it
   stop                         ask the daemon to shut down and log the stop
   tail [n]                     last n logbook events (default 20)
   watch                        stream the running session and answer approval stops
@@ -57,6 +61,8 @@ async function main(argv: string[]): Promise<number> {
       return await addTask(rest);
     case 'run':
       return await startRun();
+    case 'undo':
+      return await undo(rest);
     case 'stop':
       return await stopDaemon();
     case 'tail':
@@ -164,6 +170,68 @@ async function startRun(): Promise<number> {
 }
 
 /**
+ * Undo the last task, or a named one, by discarding the copy it worked in.
+ *
+ * Two round trips on purpose: the first describes the copy and changes nothing, and only `--yes`
+ * sends the second. Discarding is total, and it deletes the branch the task's work was sealed onto,
+ * so a human sees what will go before it goes. Forgetting the flag costs a reprint.
+ *
+ * The confirming call names the taskId the preview resolved, rather than saying "the last one"
+ * twice, and carries the previewToken that preview minted. The daemon will not discard without one,
+ * so the two-step is the daemon's rule and this flow is only its most convenient client.
+ */
+async function undo(args: string[]): Promise<number> {
+  const { positional, flags } = parseFlags(args);
+  const wanted = positional[0]?.trim();
+  const confirm = flags['yes'] === 'true' || flags['y'] === 'true';
+
+  const preview = asRecord(await get(`/undo${wanted ? `?taskId=${encodeURIComponent(wanted)}` : ''}`));
+  if (preview['error']) {
+    out(`conductor: ${String(preview['error'])}`);
+    return 1;
+  }
+
+  const taskId = String(preview['taskId']);
+  out(String(preview['workspace'] ?? ''));
+  out('');
+  out('discarding would:');
+  out(`  remove the copy    ${String(preview['worktreePath'])}`);
+  out(`  delete the branch  ${String(preview['branch'])}`);
+  out(`  seal state         ${sealLine(preview)}`);
+  out(`  leave alone        ${String(preview['repoRoot'])}, your own folder`);
+
+  if (!confirm) {
+    out('');
+    out(`nothing has been changed. Run "conductor undo ${taskId} --yes" to discard exactly this copy.`);
+    return 0;
+  }
+
+  const done = asRecord(await post('/undo', { taskId, confirm: true, previewToken: preview['previewToken'] }));
+  if (done['error']) {
+    out('');
+    out(`conductor: ${String(done['error'])}`);
+    return 1;
+  }
+  out('');
+  out(`discarded: the copy at "${String(done['worktreePath'])}" is gone and the branch "${String(done['branch'])}" is deleted.`);
+  if (done['note']) out(`  note: ${String(done['note'])}`);
+  return 0;
+}
+
+/** What the logbook says about the seal, said in words rather than in a boolean nobody can read. */
+function sealLine(preview: Record<string, unknown>): string {
+  if (typeof preview['sealFailure'] === 'string') {
+    return `the seal failed, so the branch holds no commit from this task (${String(preview['sealFailure'])})`;
+  }
+  if (preview['sealed'] === true) {
+    const files = preview['files'];
+    return `sealed, ${typeof files === 'number' ? `${files} file(s)` : 'an unrecorded number of files'} committed on that branch`;
+  }
+  if (preview['sealed'] === false) return 'sealed with nothing to commit, so the task changed no files';
+  return 'the logbook does not say whether the work was sealed, so assume the branch may hold work';
+}
+
+/**
  * The programmatic shutdown. Windows cannot deliver SIGINT to a child process, so anything that
  * starts the daemon and later wants it stopped needs this rather than a signal, and the daemon logs
  * `daemon_stop` on the way out instead of dying silently.
@@ -258,7 +326,12 @@ function render(event: Record<string, unknown>): string | null {
   const type = String(event['type']);
 
   if (type === 'session_message') return renderSessionMessage(String(event['taskId']), asRecord(event['message']));
-  if (type === 'task_started') return `\n=== task ${String(event['taskId'])} started: ${String(event['title'])} (${String(event['account'])}, ${String(event['trust'])}) ===`;
+  if (type === 'task_started') {
+    const head = `\n=== task ${String(event['taskId'])} started: ${String(event['title'])} (${String(event['account'])}, ${String(event['trust'])}) ===`;
+    // The description of the copy belongs here, at the top of the task, because what the copy lacks
+    // is what a human needs to know before the task starts acting on it rather than afterwards.
+    return typeof event['workspace'] === 'string' ? `${head}\n${event['workspace']}` : head;
+  }
   if (type === 'task_finished') {
     const error = event['errorText'] ? `, error: ${String(event['errorText'])}` : '';
     return `=== task ${String(event['taskId'])} finished: ${String(event['outcome'])}${error} ===\n  handoff: ${String(event['handoffPath'] ?? 'none')}`;
@@ -266,6 +339,7 @@ function render(event: Record<string, unknown>): string | null {
   if (type === 'run_started') return `run started over ${(event['tasks'] as unknown[] | undefined)?.length ?? 0} task(s)`;
   if (type === 'run_done') return 'run done.';
   if (type === 'run_error') return `run error: ${String(event['error'])}`;
+  if (type === 'workspace_discarded') return `  (copy for task ${String(event['taskId'])} discarded, branch ${String(event['branch'])} deleted)`;
   if (type === 'approval_settled') return `  (approval ${String(event['id'])} ${event['approved'] === true ? 'approved' : 'denied'})`;
   if (type === 'error') return `daemon says: ${String(event['error'])}`;
   if (type === 'door_message') return `  (message sent to the session: ${String(event['text'])})`;
@@ -382,4 +456,15 @@ const code = await main(process.argv.slice(2)).catch((err: unknown) => {
   process.stderr.write(`conductor: ${err instanceof Error ? err.message : String(err)}\n`);
   return 1;
 });
-if (code >= 0) process.exit(code);
+// Setting exitCode rather than calling process.exit, because `undo` is the first command that makes
+// two HTTP calls in one invocation and that combination crashes Node 24.11.1 on Windows:
+// "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\\win\\async.c, line 76", with an
+// exit code of 127 after the command had already printed the right answer. Reproduced outside
+// Conductor with two bare fetch calls followed by process.exit, so it is the platform, not us.
+// Letting the loop drain by itself exits immediately and cleanly. The unref'd timer is a safety net
+// only: it can never hold the process open, and it exists so a future command that leaves a handle
+// alive fails loudly rather than hanging a terminal forever.
+if (code >= 0) {
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 5000).unref();
+}
