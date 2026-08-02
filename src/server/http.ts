@@ -88,6 +88,42 @@ interface PendingApproval {
 const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 // What a late-joining door gets replayed. Small on purpose: the logbook is the real history.
 const RECENT_LIMIT = 50;
+// How long a preview stays confirmable. Long enough for a human to read the description and think
+// about it, short enough that a preview taken hours ago cannot authorise discarding a copy whose
+// state has moved on since.
+const UNDO_PREVIEW_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * A preview that happened, held so the discard that follows it is the one that was shown.
+ *
+ * Sol's round 2 finding, and it was a merge blocker. The two-call shape was documented and the CLI
+ * followed it, but the daemon enforced nothing: a first-ever `POST /undo` carrying a taskId and
+ * `confirm: true` deleted the worktree and the output branch with no human having seen a word about
+ * what was in it. "The client does two calls" is a convention; this is the check.
+ *
+ * Bound to the workspace identity rather than to the taskId alone, because the taskId outlives the
+ * copy. A preview of task t1's copy must not authorise discarding a different copy that later took
+ * the same id, so the branch and the worktree path are pinned too. There is no path-level plan to
+ * pin beyond that: discard is total, so the identity of the thing is the whole of the consent.
+ */
+interface UndoPreview {
+  taskId: string;
+  worktreePath: string;
+  branch: string;
+  /**
+   * The timestamp on the `workspace_created` line this preview described.
+   *
+   * The taskId, the branch and the path are not enough on their own, and the case that proves it is
+   * reachable: discard task t1's copy, restart the daemon so ids begin at t1 again, run another
+   * task, and the replacement copy has the same id, the same branch and the same path as the one
+   * the preview described. Every field the workspace record carries is identical, so the only thing
+   * left that separates them is when the record was written. Two creations for one id cannot share
+   * a millisecond, because the first has to be fully discarded before the second is allowed to
+   * exist and git takes longer than that.
+   */
+  recordStamp: string;
+  createdAt: number;
+}
 
 class Daemon {
   readonly config: Config;
@@ -100,6 +136,8 @@ class Daemon {
   /** Ids already answered. An approval is single-use; a replayed id is refused, not re-run. */
   private readonly spentApprovals = new Set<string>();
   private readonly recent: unknown[] = [];
+  /** Previews that have happened, by token. Single use, and they expire. */
+  private readonly undoPreviews = new Map<string, UndoPreview>();
   private running = false;
   private currentTaskId: string | null = null;
   private handle: SessionHandle | null = null;
@@ -411,8 +449,9 @@ class Daemon {
    * keeping: discarding sealed work deletes the task's output branch, so a human sees what will go
    * before it goes. The confirm binds to the taskId, which now identifies the whole operation.
    *
-   * The preview reads and changes nothing. The confirming call must name the taskId itself rather
-   * than inherit "the last one", so a copy created between the two calls cannot become the target.
+   * The preview reads and changes nothing, and it is the only thing that mints the token the
+   * discard needs, so the two-step is enforced here rather than trusted to the caller. The
+   * confirming call must also name the taskId itself rather than inherit "the last one".
    */
   previewUndo(taskId: string | undefined): { status: number; payload: Record<string, unknown> } {
     const workspace = findWorkspace(this.config, taskId);
@@ -428,6 +467,18 @@ class Daemon {
     }
 
     const seal = this.sealState(workspace.taskId);
+    // Random, not sequential, and minted only here. A token nobody can guess is a token nobody can
+    // present without having first been shown what it authorises.
+    const previewToken = randomBytes(18).toString('hex');
+    this.prunePreviews();
+    this.undoPreviews.set(previewToken, {
+      taskId: workspace.taskId,
+      worktreePath: workspace.worktreePath,
+      branch: workspace.branch,
+      recordStamp: this.recordStamp(workspace.taskId),
+      createdAt: Date.now(),
+    });
+
     return {
       status: 200,
       payload: {
@@ -439,6 +490,8 @@ class Daemon {
         ...seal,
         workspace: describeWorkspace(workspace),
         discarded: false,
+        previewToken,
+        expiresInSeconds: Math.round(UNDO_PREVIEW_TTL_MS / 1000),
         note:
           `nothing has been changed. Discarding deletes the copy at "${workspace.worktreePath}" and the branch ` +
           `"${workspace.branch}"${seal.sealed ? `, which holds the task's ${seal.files} sealed file(s)` : ''}. ` +
@@ -459,8 +512,39 @@ class Daemon {
       return { status: 400, payload: { error: 'discarding a copy needs "confirm": true. Ask for the preview first with GET /undo.' } };
     }
 
+    this.prunePreviews();
+    const token = typeof body['previewToken'] === 'string' ? body['previewToken'].trim() : '';
+    if (!token) return { status: 400, payload: { error: PREVIEW_FIRST } };
+    const preview = this.undoPreviews.get(token);
+    // Consumed the moment it is presented, whatever happens next. A token spent on a discard that
+    // then failed is still spent: the alternative is a token a caller can retry against a copy whose
+    // state has moved on since the human looked at it.
+    this.undoPreviews.delete(token);
+    if (!preview) return { status: 409, payload: { error: `that preview is unknown, already used, or has expired. ${PREVIEW_FIRST}` } };
+
     const workspace = findWorkspace(this.config, taskId);
     if (!workspace) return { status: 404, payload: { error: `no copy is recorded for task "${taskId}"` } };
+
+    // The identity check, and the reason the token pins more than the taskId. A task id outlives the
+    // copy that carried it, so a preview of one copy must not authorise discarding whatever copy
+    // holds that id by the time the confirm arrives.
+    const stamp = this.recordStamp(workspace.taskId);
+    if (
+      preview.taskId !== workspace.taskId ||
+      preview.worktreePath !== workspace.worktreePath ||
+      preview.branch !== workspace.branch ||
+      preview.recordStamp !== stamp
+    ) {
+      return {
+        status: 409,
+        payload: {
+          error:
+            `that preview describes a different copy: it was taken of "${preview.worktreePath}" on branch "${preview.branch}", ` +
+            `and task "${workspace.taskId}" now points at "${workspace.worktreePath}" on branch "${workspace.branch}". ` +
+            `Nothing was discarded. ${PREVIEW_FIRST}`,
+        },
+      };
+    }
 
     const seal = this.sealState(workspace.taskId);
     const outcome = discardWorkspace(this.config, workspace);
@@ -480,6 +564,51 @@ class Daemon {
         ...(outcome.note ? { note: outcome.note } : {}),
       },
     };
+  }
+
+  /**
+   * When the `workspace_created` line that findWorkspace would return was written, or '' when the
+   * log will not say. Same backwards walk and the same discard rule, so the two always agree about
+   * which record they are talking about.
+   *
+   * '' is deliberately a value that never equals a real stamp on the way in and always equals
+   * itself on the way out, so an unreadable log makes a fresh preview and its own confirm agree
+   * while never matching a preview taken when the log was readable. Unknown must not open a door.
+   */
+  private recordStamp(taskId: string): string {
+    let text: string;
+    try {
+      text = readFileSync(this.config.eventsPath, 'utf8');
+    } catch {
+      return '';
+    }
+    const lines = text.split('\n');
+    let discarded = false;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]?.trim();
+      if (!line) continue;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (event['taskId'] !== taskId) continue;
+      if (event['kind'] === 'workspace_discarded' && event['ok'] === true) {
+        discarded = true;
+        continue;
+      }
+      if (event['kind'] !== 'workspace_created') continue;
+      if (discarded) return '';
+      return typeof event['ts'] === 'string' ? event['ts'] : '';
+    }
+    return '';
+  }
+
+  /** Expired previews are gone before any lookup, so an old token can never be found at all. */
+  private prunePreviews(): void {
+    const cutoff = Date.now() - UNDO_PREVIEW_TTL_MS;
+    for (const [token, preview] of this.undoPreviews) if (preview.createdAt < cutoff) this.undoPreviews.delete(token);
   }
 
   /**
@@ -553,6 +682,10 @@ class Daemon {
     }
   }
 }
+
+/** The one sentence every rejected discard ends with, so the way out is always the same way in. */
+const PREVIEW_FIRST =
+  'Ask for the preview first with GET /undo and send back the previewToken it returns, so a human sees what would go before it goes.';
 
 /** A task that never handed off is aborted, which is neither done nor an error the model raised. */
 function statusFor(run: TaskRun): QueuedTask['status'] {

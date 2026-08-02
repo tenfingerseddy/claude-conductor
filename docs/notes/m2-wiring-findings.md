@@ -366,6 +366,138 @@ gone with the code, `http.ts` no longer says "the task loop checkpoints again", 
   repo's account registry still holds placeholders and the real config directory was named only in
   the scratch `config.json` outside the repo.
 
+## Round 2: Sol found the two-step was not enforced
+
+Sol reviewed the wiring diff. Four dimensions of five held with no findings. The fifth was a merge
+blocker and it was a good one.
+
+**The defect.** `POST /undo {"taskId": ..., "confirm": true}` succeeded with no preview ever having
+existed. `discard()` checked the taskId and the confirm flag, then looked the workspace up fresh
+and removed it. The two-step was documented in three places and followed by the CLI, and none of
+that is enforcement: a caller's first-ever request could delete the worktree and the output branch
+with no human having seen a word about what was in them. "The client does two calls" is a
+convention. The whole point of the confirm is that discarding sealed work destroys a task's output,
+and a convention does not protect that.
+
+**The fix.** `GET /undo` mints a single-use token and returns it with the description. `POST /undo`
+requires it, consumes it the moment it is presented, and refuses a missing, unknown, consumed,
+expired or wrong-workspace token with a sentence that names the way out. Ten minute expiry, held in
+memory: a daemon restart losing tokens just means preview again, which is the correct failure.
+
+Two details worth stating.
+
+**Consumed on presentation, not on success.** A token spent on a discard that then failed is still
+spent. The alternative is a token a caller can retry against a copy whose state has moved on since
+a human looked at it, which is the same staleness problem the old plan fingerprint existed to solve.
+
+**The pin carries a fourth field.** Sol prescribed taskId plus worktree path plus branch, and that
+is enough for every case reachable today. It is not enough in general, and the gap is one slice
+away: task ids come from a counter that restarts with the daemon, so a replacement copy for a
+reused id has the same id, the same branch and the same path as the one a stale token described.
+Every field the workspace record carries would be identical. So the token also pins the timestamp
+of the `workspace_created` line it described, read back out of the logbook with the same backwards
+walk and the same discard rule `findWorkspace` uses, so the two always agree about which record
+they mean. Two creations for one id cannot share a millisecond, because the first has to be fully
+discarded before the second is allowed to exist and git takes longer than that.
+
+### Round 2 finish line
+
+Twenty checks against a live daemon on port 7734, three real Haiku tasks in the same scratch repo,
+driven over the real loopback door with a real `conductor watch` answering the taps. All passed.
+
+```
+00:34:33 [http] POST /undo {"taskId":"t1","confirm":true}
+00:34:33 [http]   -> 400 {"error":"Ask for the preview first with GET /undo and send back the previewToken it returns, so a human sees what would go before it goes."}
+00:34:33 [CHECK] ok   a first-ever confirm is refused
+00:34:33 [CHECK] ok   the copy is still there after the blind confirm
+00:34:33 [CHECK] ok   the branch is still there after the blind confirm
+00:34:33 [http] POST /undo {"taskId":"t1","confirm":true,"previewToken":"deadbeefdeadbeefdeadbeefdeadbeef"}
+00:34:33 [http]   -> 409 {"error":"that preview is unknown, already used, or has expired. Ask for the preview first with GET /undo and send back the previewToken it returns, so a human sees what would go before it goes."}
+00:34:33 [CHECK] ok   an invented token is refused
+00:34:33 [CHECK] ok   the copy is still there after the invented token
+```
+
+```
+00:34:33 [CHECK] ok   the preview mints a token
+00:34:33 [CHECK] ok   the preview changed nothing
+00:34:33 [http] POST /undo {"taskId":"t1","confirm":true,"previewToken":"6e2c920c793a26148a3bd6f92fa24a6eedfa"}
+00:34:33 [http]   -> 200 {..."discarded":true}
+00:34:33 [CHECK] ok   the confirm with the token succeeds
+00:34:33 [CHECK] ok   the copy is gone
+00:34:33 [CHECK] ok   the branch is gone
+00:34:33 [http] POST /undo {"taskId":"t1","confirm":true,"previewToken":"6e2c920c793a26148a3bd6f92fa24a6eedfa"}
+00:34:33 [http]   -> 409 {"error":"that preview is unknown, already used, or has expired. ..."}
+00:34:33 [CHECK] ok   a replayed token is refused
+```
+
+A token minted of t2's copy, then t3 runs and the newest record moves on:
+
+```
+00:34:47 [CHECK] ok   the bare preview resolved to the newest copy
+00:35:05 [http] POST /undo {"taskId":"t3","confirm":true,"previewToken":"691346dd480201f4738c6cfb1259dd0fe916"}
+00:35:05 [http]   -> 409 {"error":"that preview describes a different copy: it was taken of \"...\\workspaces\\t2\" on branch \"conductor/task-t2\", and task \"t3\" now points at \"...\\workspaces\\t3\" on branch \"conductor/task-t3\". Nothing was discarded. ..."}
+00:35:05 [CHECK] ok   a token taken of t2 cannot discard t3
+00:35:05 [CHECK] ok   t3 copy survives the mismatched token
+00:35:05 [CHECK] ok   t2 copy survives it too
+00:35:05 [CHECK] ok   the mismatched token was consumed by the attempt
+00:35:05 [CHECK] ok   t2 copy still survives
+```
+
+The CLI flow, unchanged for the human and now carrying the token underneath:
+
+```
+00:35:05 [CHECK] ok   CLI preview prints the plan and changes nothing
+00:35:05 [CHECK] ok   CLI preview does not leak the token to the terminal
+00:35:05 [CHECK] ok   CLI confirm discards
+00:35:05 [CHECK] ok   CLI confirm discards t3 too
+00:35:07 [harness] ALL CHECKS PASSED
+```
+
+### The fourth pin field, exercised
+
+Six more checks on port 7735, run apart because the case is not reachable through the CLI today:
+ids do not repeat inside one daemon, and a restart loses the tokens anyway. So it is exercised the
+way the legacy-kinds check was, by writing the line a reused id would write. The replacement record
+is byte-identical to the real one except for its timestamp, which means that without the stamp in
+the pin the stale token would sail through and discard a copy holding somebody else's work.
+
+```
+00:36:40 [harness] appended a replacement workspace_created for t1 at ts 2026-08-02T00:36:07.541Z (the real one is 2026-08-02T00:36:06.541Z)
+00:36:40 [harness] taskId, branch and worktreePath are all identical between the two records:
+00:36:40 [harness]   taskId t1 | branch conductor/task-t1 | path C:\Users\...\workspaces\t1
+00:36:40 [http] POST /undo {"taskId":"t1","confirm":true,"previewToken":"3f0853065f41666dcac6cc2876bc1b2c6ab5"}
+00:36:40 [http]   -> 409 {"error":"that preview describes a different copy: ..."}
+00:36:40 [CHECK] ok   a token taken of the earlier record is refused
+00:36:40 [CHECK] ok   the copy survives it
+00:36:40 [CHECK] ok   the branch survives it
+00:36:41 [CHECK] ok   a fresh preview of the current record still discards
+00:36:41 [CHECK] ok   the copy is gone
+00:36:41 [CHECK] ok   the branch is gone
+00:36:42 [harness] ALL CHECKS PASSED
+```
+
+The scratch repo came out of all four tasks and all twenty-six checks exactly as it went in:
+
+```
+00:36:41 [git] final worktrees:
+00:36:41 [git] C:/Users/KaneSnyder(nexwave)/AppData/Local/Temp/cwire/repo  a345400 [main]
+00:36:41 [git] final branches:
+00:36:41 [git] * main
+00:36:41 [git] final status:
+00:36:41 [git] M keep.md
+00:36:41 [git] ?? scratchpad.txt
+```
+
+`npx tsc --noEmit` exit 0 behind the node_modules guard after the change.
+
+### What round 2 did not close
+
+An unreadable `events.jsonl` makes the stamp `''` for both the preview and its confirm, so they
+agree with each other. That is deliberate: a value that never equals a real stamp on the way in and
+always equals itself on the way out means an unknown never opens a door it would not otherwise
+open, while a log that cannot be read does not lock a human out of their own undo. The other three
+pin fields still have to match.
+
 ## Left for the next slice
 
 - Nothing in `isolation.ts` needed a signature change, so the module is exactly as reviewed.

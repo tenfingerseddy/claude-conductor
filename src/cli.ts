@@ -177,7 +177,8 @@ async function startRun(): Promise<number> {
  * so a human sees what will go before it goes. Forgetting the flag costs a reprint.
  *
  * The confirming call names the taskId the preview resolved, rather than saying "the last one"
- * twice: a copy created between the two calls must not be able to become the target.
+ * twice, and carries the previewToken that preview minted. The daemon will not discard without one,
+ * so the two-step is the daemon's rule and this flow is only its most convenient client.
  */
 async function undo(args: string[]): Promise<number> {
   const { positional, flags } = parseFlags(args);
@@ -205,7 +206,7 @@ async function undo(args: string[]): Promise<number> {
     return 0;
   }
 
-  const done = asRecord(await post('/undo', { taskId, confirm: true }));
+  const done = asRecord(await post('/undo', { taskId, confirm: true, previewToken: preview['previewToken'] }));
   if (done['error']) {
     out('');
     out(`conductor: ${String(done['error'])}`);
