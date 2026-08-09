@@ -341,19 +341,27 @@ class Daemon {
    * produced. Aggregation lives here rather than in the CLI because the CLI is a thin door: the
    * phone and the VS Code panel must get the same figures without recomputing them.
    *
-   * Three honesty rules the report keeps, because it is the number Kane will put in front of
-   * leadership when arguing for another account:
+   * Five honesty rules the report keeps, because it is the number Kane will put in front of
+   * leadership when arguing for another account. Four of them are Sol's findings 2 to 5:
    *
-   *   1. An unmatched pause, where the daemon died before its resume, counts as a pause and is
-   *      listed by name, but never contributes a guessed duration. A total that quietly includes
-   *      invented time is worse than a total with a footnote.
-   *   2. The recoverable share means only what it says: lost time during which another account's
-   *      reading, taken at pause start, showed room under the same threshold. Those readings come
-   *      from the file layer and the file layer goes stale, so the sentence says so.
-   *   3. Zero pauses is a real answer and prints as one, rather than as an empty table.
+   *   1. A hold is paired by its own id, never by account order. Two overlapping holds on one
+   *      account used to swap durations and report one wrong number plus one unknown.
+   *   2. Time is counted by intersecting each hold with the reporting window, so a hold that began
+   *      before the cutoff still contributes the part of itself that lands inside it. Filtering on
+   *      the start alone could answer "nothing lost" for a week in which hours were.
+   *   3. The recoverable share counts only holds where another account's snapshot was evidence the
+   *      pause gate itself would have acted on. A stale file reading zero is not headroom.
+   *   4. A hold with no recorded end, or with a duration that cannot be true, is counted and listed
+   *      and contributes nothing. Invented or negative minutes are worse than a footnote.
+   *   5. Zero holds is a real answer and prints as one, rather than as an empty table.
+   *
+   * "Total" is account-hours, not elapsed downtime: two accounts each held for an hour is two
+   * account-hours, and the output says so rather than letting a reader assume the machine stood
+   * still for two hours.
    */
   lostTime(days: number): Record<string, unknown> {
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const cutoff = now - days * 24 * 60 * 60 * 1000;
     let text: string;
     try {
       text = readFileSync(this.config.eventsPath, 'utf8');
@@ -361,20 +369,25 @@ class Daemon {
       return { days, error: 'the logbook could not be read, so there is nothing to report' };
     }
 
-    interface Pause {
+    interface Hold {
+      holdId: string;
       account: string;
-      ts: string;
+      taskId: string;
+      startedAtMs: number;
+      startedAt: string;
       window: string;
       utilization: number;
       reason: string;
-      otherHadHeadroom: boolean;
+      otherHadUsableHeadroom: boolean;
       lostMs: number | null;
-      plannedMs: number | null;
+      /** Set when a resume arrived carrying a duration that cannot be true. */
+      malformed: string | null;
+      rounds: number;
       interrupted: boolean;
     }
 
-    const open = new Map<string, Pause>();
-    const pauses: Pause[] = [];
+    const holds = new Map<string, Hold>();
+    const order: string[] = [];
 
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
@@ -384,95 +397,164 @@ class Daemon {
       } catch {
         continue;
       }
+      const kind = event['kind'];
+      if (kind !== 'limit_pause' && kind !== 'limit_resume') continue;
       const account = typeof event['account'] === 'string' ? event['account'] : '';
       if (!account) continue;
 
-      if (event['kind'] === 'limit_pause') {
-        // A second pause with the first still open means the first never got its resume line.
-        const orphan = open.get(account);
-        if (orphan) pauses.push(orphan);
+      // Lines written before holds existed carry no id. They paired by account, so they are given a
+      // per-account key that reproduces exactly that, which keeps an old logbook readable without
+      // pretending it has an identity it never had.
+      const holdId = typeof event['holdId'] === 'string' && event['holdId'] ? event['holdId'] : `legacy:${account}`;
+
+      if (kind === 'limit_pause') {
         const threshold = typeof event['threshold'] === 'number' ? event['threshold'] : 100;
         const others = Array.isArray(event['otherAccounts']) ? event['otherAccounts'] : [];
-        open.set(account, {
+        const startedRaw = typeof event['startedAt'] === 'string' ? event['startedAt'] : typeof event['ts'] === 'string' ? event['ts'] : '';
+        const startedAtMs = Date.parse(startedRaw);
+        const hold: Hold = {
+          holdId,
           account,
-          ts: typeof event['ts'] === 'string' ? event['ts'] : '',
+          taskId: typeof event['taskId'] === 'string' ? event['taskId'] : 'unknown',
+          startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : NaN,
+          startedAt: startedRaw,
           window: String(event['window'] ?? 'unknown'),
           utilization: typeof event['utilization'] === 'number' ? event['utilization'] : NaN,
           reason: String(event['reason'] ?? 'threshold'),
-          // Headroom means room on both windows. A null is an absent reading, never a zero, so it
-          // is not headroom either.
-          otherHadHeadroom: others.some((raw) => {
-            const other = asRecord(raw);
-            const five = other['fiveHour'];
-            const week = other['weekly'];
-            return typeof five === 'number' && five < threshold && typeof week === 'number' && week < threshold;
-          }),
+          otherHadUsableHeadroom: others.some((raw) => hadUsableHeadroom(asRecord(raw), threshold)),
           lostMs: null,
-          plannedMs: null,
+          malformed: null,
+          rounds: 1,
           interrupted: false,
-        });
+        };
+        // A repeated legacy key is a second old-style pause on the same account: keep both, since
+        // each is a real halt, and let the second simply take the key for future pairing.
+        if (holds.has(holdId)) {
+          const previous = holds.get(holdId)!;
+          const parked = `${holdId}#${order.length}`;
+          holds.set(parked, { ...previous, holdId: parked });
+          order[order.indexOf(holdId)] = parked;
+        }
+        holds.set(holdId, hold);
+        order.push(holdId);
         continue;
       }
 
-      if (event['kind'] === 'limit_resume') {
-        const pause = open.get(account);
-        if (!pause) continue; // a resume with no pause in the window being read: nothing to attribute
-        open.delete(account);
-        pause.lostMs = typeof event['lostMs'] === 'number' ? event['lostMs'] : null;
-        pause.plannedMs = typeof event['plannedMs'] === 'number' ? event['plannedMs'] : null;
-        pause.interrupted = event['interrupted'] === true;
-        pauses.push(pause);
+      const hold = holds.get(holdId);
+      if (!hold || hold.lostMs !== null || hold.malformed !== null) continue; // a resume for a hold this log does not open
+      const lostMs = event['lostMs'];
+      hold.rounds = typeof event['rounds'] === 'number' && event['rounds'] > 0 ? event['rounds'] : hold.rounds;
+      hold.interrupted = event['interrupted'] === true;
+      if (typeof lostMs !== 'number' || !Number.isFinite(lostMs) || lostMs < 0) {
+        // Defensive, and it stays defensive even now the writer uses a monotonic clock: a duration
+        // this report cannot believe is named, not silently dropped and never summed. A negative one
+        // added to a total would reduce it, which is the one direction nobody would question.
+        hold.malformed = `the recorded duration was ${JSON.stringify(lostMs)}, which is not a length of time`;
+      } else {
+        hold.lostMs = lostMs;
       }
     }
-    for (const pause of open.values()) pauses.push(pause); // still open, or the daemon died mid-wait
 
-    const inWindow = pauses.filter((pause) => {
-      const at = Date.parse(pause.ts);
-      return Number.isFinite(at) && at >= cutoff;
-    });
+    // The last hold on an account is the only one that could still be running now. An earlier
+    // unmatched one is provably over, however the log lost its ending.
+    const lastByAccount = new Map<string, string>();
+    for (const holdId of order) {
+      const hold = holds.get(holdId);
+      if (hold) lastByAccount.set(hold.account, holdId);
+    }
 
-    const byAccount = new Map<string, { account: string; pauses: number; lostMs: number; longestMs: number; recoverableMs: number; unknownDuration: number; interrupted: number }>();
-    for (const pause of inWindow) {
-      const row = byAccount.get(pause.account) ?? { account: pause.account, pauses: 0, lostMs: 0, longestMs: 0, recoverableMs: 0, unknownDuration: 0, interrupted: 0 };
-      row.pauses++;
-      if (pause.interrupted) row.interrupted++;
-      if (pause.lostMs === null) {
+    interface Row {
+      account: string;
+      holds: number;
+      lostMs: number;
+      longestMs: number;
+      recoverableMs: number;
+      unknownDuration: number;
+      interrupted: number;
+      rounds: number;
+    }
+    const byAccount = new Map<string, Row>();
+    const unmatched: Record<string, unknown>[] = [];
+    const malformed: Record<string, unknown>[] = [];
+
+    for (const holdId of order) {
+      const hold = holds.get(holdId);
+      if (!hold || !Number.isFinite(hold.startedAtMs)) continue;
+
+      const ended = hold.lostMs === null ? null : hold.startedAtMs + hold.lostMs;
+      // The part of this hold that lies inside the window being reported on. An open or malformed
+      // hold has no end, so it can only be listed, never measured.
+      const counted = ended === null ? 0 : Math.max(0, Math.min(ended, now) - Math.max(hold.startedAtMs, cutoff));
+      const listable = hold.startedAtMs >= cutoff || lastByAccount.get(hold.account) === holdId;
+      if (counted === 0 && !(hold.lostMs === null && listable)) continue;
+
+      const row = byAccount.get(hold.account) ?? {
+        account: hold.account,
+        holds: 0,
+        lostMs: 0,
+        longestMs: 0,
+        recoverableMs: 0,
+        unknownDuration: 0,
+        interrupted: 0,
+        rounds: 0,
+      };
+      row.holds++;
+      row.rounds += hold.rounds;
+      if (hold.interrupted) row.interrupted++;
+      if (hold.lostMs === null) {
         row.unknownDuration++;
+        const entry = {
+          account: hold.account,
+          taskId: hold.taskId,
+          holdId: hold.holdId,
+          at: hold.startedAt,
+          window: hold.window,
+          reason: hold.reason,
+          stillOpen: lastByAccount.get(hold.account) === holdId,
+        };
+        if (hold.malformed) malformed.push({ ...entry, problem: hold.malformed });
+        else unmatched.push(entry);
       } else {
-        row.lostMs += pause.lostMs;
-        row.longestMs = Math.max(row.longestMs, pause.lostMs);
-        if (pause.otherHadHeadroom) row.recoverableMs += pause.lostMs;
+        row.lostMs += counted;
+        // The whole hold, not the counted slice: the worst single halt is a fact about the halt,
+        // and clipping it to the report window would understate the incident it describes.
+        row.longestMs = Math.max(row.longestMs, hold.lostMs);
+        if (hold.otherHadUsableHeadroom) row.recoverableMs += counted;
       }
-      byAccount.set(pause.account, row);
+      byAccount.set(hold.account, row);
     }
 
     const accounts = [...byAccount.values()].sort((a, b) => b.lostMs - a.lostMs);
     const total = accounts.reduce(
       (sum, row) => ({
-        pauses: sum.pauses + row.pauses,
+        holds: sum.holds + row.holds,
         lostMs: sum.lostMs + row.lostMs,
         longestMs: Math.max(sum.longestMs, row.longestMs),
         recoverableMs: sum.recoverableMs + row.recoverableMs,
         unknownDuration: sum.unknownDuration + row.unknownDuration,
         interrupted: sum.interrupted + row.interrupted,
+        rounds: sum.rounds + row.rounds,
       }),
-      { pauses: 0, lostMs: 0, longestMs: 0, recoverableMs: 0, unknownDuration: 0, interrupted: 0 },
+      { holds: 0, lostMs: 0, longestMs: 0, recoverableMs: 0, unknownDuration: 0, interrupted: 0, rounds: 0 },
     );
 
     return {
       days,
       from: new Date(cutoff).toISOString(),
+      to: new Date(now).toISOString(),
       accounts,
       total,
-      unmatched: inWindow
-        .filter((pause) => pause.lostMs === null)
-        .map((pause) => ({ account: pause.account, at: pause.ts, window: pause.window, utilization: pause.utilization, reason: pause.reason })),
+      unmatched,
+      malformed,
       note:
-        'Recoverable time is time lost while another account\'s reading showed room under the same threshold. ' +
-        'Those readings are taken from each account\'s file at the moment the pause started, and that file can be ' +
-        'stale, so treat the recoverable share as an indication rather than a measurement. Pauses with no recorded ' +
-        'end are counted and listed but contribute no time, because their length is unknown and guessing it would ' +
-        'inflate the figure this report exists to be trusted on.',
+        'Lost time is account-hours, not elapsed downtime: two accounts each held for an hour is two ' +
+        'account-hours. Time is counted by the part of each hold that falls inside this window, so a hold ' +
+        'that began earlier contributes only its part inside it, while "longest" is the whole of the worst ' +
+        'single hold. Recoverable time is time lost while another account had room under the same threshold, ' +
+        'measured from that account\'s reading at the moment this hold started, counting only readings fresh ' +
+        'enough that the pause gate would itself have acted on them. It says nothing about whether that room ' +
+        'lasted, or whether that account could have done the work. Holds with no recorded end, or with a ' +
+        'duration that cannot be true, are counted and listed and contribute no time at all.',
     };
   }
 
@@ -834,6 +916,26 @@ class Daemon {
       // A door that cannot be written to is a door that has gone; never let it break the run.
     }
   }
+}
+
+/**
+ * Did this other-account snapshot show room, on evidence the pause gate would have acted on?
+ *
+ * Three things must all be true, and Sol's finding 2 was that only the first was being checked. The
+ * account must read under the threshold on both windows; a null is an absent reading and never a
+ * zero. And each of those readings must have been usable at the moment it was taken, which the
+ * writer records per window using the same `usableForPause` test the gate applies to the account it
+ * is about to hold. A week-old file reading zero used to turn a six-hour wait into six recoverable
+ * hours, which is the strongest claim in this feature resting on the weakest evidence in it.
+ *
+ * A snapshot written before those flags existed has neither, so it cannot qualify. That is the right
+ * default: an old line cannot prove freshness it never recorded.
+ */
+function hadUsableHeadroom(other: Record<string, unknown>, threshold: number): boolean {
+  if (other['fiveHourUsable'] !== true || other['weeklyUsable'] !== true) return false;
+  const five = other['fiveHour'];
+  const week = other['weekly'];
+  return typeof five === 'number' && five < threshold && typeof week === 'number' && week < threshold;
 }
 
 /** The one sentence every rejected discard ends with, so the way out is always the same way in. */

@@ -120,28 +120,75 @@ export type ConductorEvent =
   // decision, so it deserves a measured number rather than a feeling that things sometimes stall.
   | {
       kind: 'limit_pause';
+      /**
+       * One hold, one identity. Sol's finding 5: pairing a resume to a pause by account alone gives
+       * the wrong answer the moment two holds on one account overlap, and it reported each re-read
+       * round of a single unbroken halt as its own incident, inflating the count and shrinking the
+       * worst case. A hold now spans every round the task stayed blocked, and both of its events
+       * carry this token.
+       */
+      holdId: string;
+      /** The task that did not start. Present so a hold can be traced to the work it delayed. */
+      taskId: string;
       account: string;
+      /** When the hold began, as an instant. The report intersects durations against its window. */
+      startedAt: string;
+      /** The window whose reset the wait is aimed at: the one that clears last. */
       window: 'session_5h' | 'weekly_all';
       utilization: number;
       resetsAt: string;
       threshold: number;
-      /** `paid_credit_boundary` means the account would have started spending money, not stopped. */
+      /** The strongest cause that fired, for a reader who wants one word. See `causes` for all. */
       reason: 'threshold' | 'paid_credit_boundary';
+      /**
+       * Every cause that fired, per window, recorded independently of which window is being waited
+       * on. Sol's finding 7: a weekly window at 96% binds the wait because it clears last, and
+       * labelling the whole pause `threshold` then hides that the five-hour window was
+       * simultaneously at 100% on an account that spends money past that line. Someone reading the
+       * log to decide whether to raise the threshold has to see both.
+       */
+      causes: { window: 'session_5h' | 'weekly_all'; utilization: number; kind: 'threshold' | 'paid_credit_boundary' }[];
+      /** The credit setting at pause start, with the freshness of the block it was read from. */
+      creditsEnabled: boolean | null;
+      creditsFresh: boolean;
       /** How many tasks were behind this one, including it, when the wait started. */
       tasksWaiting: number;
       /**
        * What every other usable account read at pause start. Names only, the ones already in the
-       * user's own config; no emails and no account identifiers, per the scrub rule. A null
-       * percentage is an absent reading and never a zero, and these are file reads, so they carry
-       * the staleness the file layer always carries. The report says so in words rather than
-       * letting a reader assume otherwise.
+       * user's own config; no emails and no account identifiers, per the scrub rule.
+       *
+       * Each reading carries whether it was usable by the same test the pause gate itself applies,
+       * because Sol's finding 2 was that a week-old file reading 0% counted as headroom and turned
+       * a six-hour wait into six recoverable hours on evidence the gauge would have refused to act
+       * on. A null percentage is an absent reading and never a zero.
        */
-      otherAccounts: { account: string; fiveHour: number | null; weekly: number | null }[];
+      otherAccounts: {
+        account: string;
+        /** Age of that account's block at this instant, or null when it will not say. */
+        ageMs: number | null;
+        fiveHour: number | null;
+        weekly: number | null;
+        /** Usable by `usableForPause`: present, fresh, and describing a window that has not passed. */
+        fiveHourUsable: boolean;
+        weeklyUsable: boolean;
+      }[];
     }
-  // lostMs is wall clock actually spent waiting. plannedMs is what the pause said it would be when
-  // it started, so the two disagreeing is itself worth seeing. interrupted means the daemon stopped
-  // mid-wait, so the task never did start.
-  | { kind: 'limit_resume'; account: string; lostMs: number; plannedMs: number; interrupted: boolean }
+  // lostMs is elapsed time actually spent waiting, measured on a monotonic clock so a system clock
+  // correction cannot make it negative or inflate it. plannedMs is what the hold said it would be
+  // when it started, so the two disagreeing is itself worth seeing. `rounds` is how many times the
+  // gauge was re-read inside this one hold. interrupted means the daemon stopped mid-wait, so the
+  // task never did start.
+  | {
+      kind: 'limit_resume';
+      holdId: string;
+      taskId: string;
+      account: string;
+      startedAt: string;
+      lostMs: number;
+      plannedMs: number;
+      rounds: number;
+      interrupted: boolean;
+    }
   // The gauge could not say where the window stood, so nothing was paused. Logged because a silent
   // "no reading, carry on" and a silent "no reading, stop" are indistinguishable afterwards, and one
   // of them idles a full tank.

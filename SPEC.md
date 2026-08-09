@@ -201,24 +201,41 @@ panic and wrap up early.
 
 Goal 2 says limits must never halt progress. Sometimes they do anyway, and when they do the halt is
 measured rather than merely endured. Above a threshold written in the playbook, a queued task does
-not start: the service waits for the binding window to reset, then looks again. Each wait writes
-two lines to the logbook. The pause names the account, the window, where it stood, when it resets,
-why it fired, how many tasks are behind it, and what every other account's tank read at that
-moment. The resume names what the wait actually cost in wall clock against what it was predicted to
-cost, and whether it was cut short.
+not start: the service waits for the binding window to reset, then looks again. That whole halt,
+however many times the gauge is re-read inside it, is one hold with one identity, and it writes two
+lines to the logbook. The pause names the account, the task, the window being waited on, every cause
+that fired across both windows, how many tasks are behind it, and what every other account's tank
+read at that moment. The resume names what the hold actually cost, measured on a monotonic clock so
+a system clock correction cannot invent or erase time, against what it was predicted to cost, and
+whether it was cut short.
+
+Waiting has an end. After a small number of rounds in which fresh readings still say there is no
+room, the task is refused rather than started. A retry ceiling exists to stop Conductor waiting
+forever on numbers it cannot make sense of; it is not a grant of passage, and a ceiling that ends by
+starting the task would quietly turn the paid-credit rail below into a three-strikes rule.
 
 That pairing is the whole point, and it exists because the decision it feeds is a spending decision.
 Adding an account costs money and the argument for it should be a number, not a feeling that things
 sometimes stall. So `lost-time` reports, per account and in total, how often work stopped, how long
-for, the longest single wait, and how much of that time another account had room to spare. Each of
-those claims is bounded in writing: the other-account readings are file reads taken at pause start
-and the file layer goes stale, so the recoverable share is an indication and says so. A pause whose
-end was never recorded is counted and listed by name and contributes no time at all, because a
-total that quietly includes invented minutes is worth less than one with a footnote.
+for, the longest single hold, and how much of that time another account had room to spare.
+
+Every one of those claims is bounded in writing, because a report that overstates once is never
+trusted again. Time is counted by intersecting each hold with the window being reported on, so a
+hold that began before the cutoff contributes the part of itself inside it rather than nothing at
+all. The total is account-hours and not elapsed downtime, and the output says which. The recoverable
+share counts only holds where another account's reading was fresh enough that the pause gate would
+itself have acted on it, and it still claims no more than what was true at that instant: a snapshot
+proves headroom at pause start, never that the headroom lasted or that the other account could have
+done the work. And a hold whose end was never recorded, or whose recorded length cannot be true, is
+counted and listed by name and contributes no time at all, because a total that quietly includes
+invented minutes is worth less than one with a footnote.
 
 Two rails sit on the same mechanism. Crossing from plan usage into paid extra-usage credits fires
 the pause at the plan limit regardless of the threshold, since past that line the account spends
-real money instead of stopping. And a pause needs a reading it can stand on: if the gauge cannot say
+real money instead of stopping. Causes are recorded per window and independently of the wait, so a
+weekly window at 96% that decides how long the wait runs never hides a five-hour window sitting on
+the money line at the same moment: someone reading the log to decide whether to relax the threshold
+has to see that the stop also prevented real spending. And a pause needs a reading it can stand on: if the gauge cannot say
 where the window sits, because there is no reading, the reading is stale, or its own reset time has
 already passed, nothing is paused. That case is logged too. A gauge that idles a full tank on a
 guess is a worse failure than one that starts a task the account then refuses, and it is the failure

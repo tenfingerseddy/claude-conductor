@@ -5,12 +5,13 @@
 // the note it wrote to the next task. The list is a plain array on purpose. The real queue, with
 // pacing and playbook rules deciding what runs when, is M2.
 
+import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, resolveAccount, usableAccounts, type Config } from './config.ts';
 import { buildOpeningPrompt, logCut, type Carry } from './engine/cut.ts';
 import { logTaskFinish, type FinishTaskCall } from './engine/finish-task.ts';
-import { Gauge, readOfficialFile, usableForPause, type Reading, type UsageWindows, type WindowId } from './engine/gauge.ts';
+import { Gauge, readOfficialFile, usableForPause, windowIdFor, type Reading, type UsageWindows, type WindowId } from './engine/gauge.ts';
 import { createWorkspace, describeWorkspace, sealWorkspace, type Workspace } from './engine/isolation.ts';
 import { runSession, trustRefusal, type Approver, type SessionHandle, type Task } from './engine/session.ts';
 import { startDaemon } from './server/http.ts';
@@ -65,18 +66,26 @@ export interface RunTasksOptions {
 export const RESET_GRACE_MS = 60 * 1000;
 
 /**
- * How many times one task may pause before Conductor gives up and starts it anyway.
+ * How many resets one hold may wait out before the task is refused.
  *
  * Not a safety valve for the common case, which resolves on round one. It is there because every
- * round after the first is being told by the account that a window we just waited out is still
- * full, and at that point the honest reading is that we do not understand the numbers rather than
- * that we should keep waiting. Starting a task that the account then refuses costs one wasted
- * start. Waiting forever costs the machine.
+ * round after the first is the account saying a window we already waited out is still full, and at
+ * that point the honest reading is that Conductor does not understand these numbers.
+ *
+ * What it does *not* do is let the task through. Sol's finding 1: ending the ceiling by starting the
+ * task turned the paid-credit rail into a three-strikes rule, so the ceiling now ends in a refusal.
+ * Waiting forever costs the machine; passing costs money. Refusing costs a re-queue.
  */
 const MAX_PAUSE_ROUNDS = 3;
 
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
 /** What a door shows while a task is held back. */
 export interface PauseNotice {
+  holdId: string;
+  startedAt: string;
   taskId: string;
   account: string;
   window: WindowId;
@@ -112,18 +121,41 @@ export function interruptPauses(): number {
   return closing.length;
 }
 
-function pauseSentence(notice: Omit<PauseNotice, 'sentence'>): string {
-  const windowName = notice.window === 'session_5h' ? '5-hour' : 'weekly';
-  const why =
-    notice.reason === 'paid_credit_boundary'
-      ? `that is the plan limit, which this account does not stop at: extra-usage credits are enabled, so more work would spend real money`
-      : `that is at or above the ${notice.threshold}% pause threshold`;
-  const others = notice.tasksWaiting - 1;
-  const queue = others > 0 ? ` ${notice.tasksWaiting} tasks are waiting, including this one.` : ' It is the only task waiting.';
+function windowName(window: WindowId): string {
+  return window === 'session_5h' ? '5-hour' : 'weekly';
+}
+
+/**
+ * The sentence a human reads. It names every cause, not only the one being waited on, for the same
+ * reason the event does: the window that decides how long the wait is and the window that decides
+ * whether money was at stake need not be the same window.
+ */
+function pauseSentence(notice: Omit<PauseNotice, 'sentence' | 'holdId' | 'startedAt'>, causes: GateVerdict['causes']): string {
+  // Grouped by window, because one window can fire both causes and saying "the 5-hour window is at
+  // 100%" twice in one sentence reads like a stutter rather than like two facts.
+  const byWindow = new Map<WindowId, { utilization: number; kinds: Set<string> }>();
+  for (const cause of causes) {
+    const entry = byWindow.get(cause.window) ?? { utilization: cause.utilization, kinds: new Set<string>() };
+    entry.kinds.add(cause.kind);
+    byWindow.set(cause.window, entry);
+  }
+  const reasons = [...byWindow.entries()].map(([window, entry]) => {
+    const parts: string[] = [];
+    if (entry.kinds.has('threshold')) parts.push(`at or above the ${notice.threshold}% pause threshold`);
+    if (entry.kinds.has('paid_credit_boundary')) {
+      parts.push('at the plan limit, which this account does not stop at because extra-usage credits are enabled, so more work would spend real money');
+    }
+    return `the ${windowName(window)} window is at ${Math.round(entry.utilization)}%, ${parts.join(', and ')}`;
+  });
+  const queue = notice.tasksWaiting > 1 ? ` ${notice.tasksWaiting} tasks are waiting, including this one.` : ' It is the only task waiting.';
+  // Said only when it is true: with both windows tripped, the wait is aimed at the one that clears
+  // last, because clearing the earlier one would leave the later one still blocking.
+  const later = new Set(causes.map((cause) => cause.window)).size > 1 ? ', the later of the two to clear,' : '';
+  const why = reasons.join('; and ');
   return (
-    `Paused: task ${notice.taskId} has not started. Account "${notice.account}" is at ` +
-    `${Math.round(notice.utilization)}% of its ${windowName} window and ${why}. Waiting until that window resets at ` +
-    `${notice.resetsAt}, then starting.${queue}`
+    `Paused: task ${notice.taskId} has not started on account "${notice.account}". ` +
+    `${why.charAt(0).toUpperCase()}${why.slice(1)}. Waiting until the ${windowName(notice.window)} window${later} ` +
+    `resets at ${notice.resetsAt}, then starting.${queue}`
   );
 }
 
@@ -149,25 +181,112 @@ function unusableReason(window: keyof UsageWindows, percent: number, reading: Re
   );
 }
 
-/** Every other usable account's file reading, taken at this moment. Names only, never identities. */
-function otherAccountReadings(config: Config, paused: string): { account: string; fiveHour: number | null; weekly: number | null }[] {
+/**
+ * Every other usable account's file reading, taken at this moment, each carrying whether it is
+ * evidence Conductor would itself act on.
+ *
+ * The freshness flags are the whole point. Without them the report counted a week-old file reading
+ * zero as proof of headroom, which is the strongest claim in the whole feature resting on the
+ * weakest evidence in it. `usableForPause` is reused rather than reimplemented so the standard for
+ * "this account had room" is literally the standard for "this account had no room".
+ */
+function otherAccountReadings(
+  config: Config,
+  paused: string,
+): { account: string; ageMs: number | null; fiveHour: number | null; weekly: number | null; fiveHourUsable: boolean; weeklyUsable: boolean }[] {
+  const now = Date.now();
   return usableAccounts(config)
     .filter((account) => account.name !== paused)
     .map((account) => {
-      const file = readOfficialFile(account.configDir);
+      const file = readOfficialFile(account.configDir, now);
       return {
         account: account.name,
+        ageMs: file?.ageMs ?? null,
         fiveHour: file?.fiveHour.percent ?? null,
         weekly: file?.weekly.percent ?? null,
+        fiveHourUsable: file ? usableForPause('fiveHour', file.fiveHour, now) !== null : false,
+        weeklyUsable: file ? usableForPause('weekly', file.weekly, now) !== null : false,
       };
     });
 }
 
+/** Everything the pause gate concluded about one look at the gauge. */
+interface GateVerdict {
+  /** Every cause that fired, across both windows, independent of which one is waited on. */
+  causes: { window: WindowId; utilization: number; kind: 'threshold' | 'paid_credit_boundary' }[];
+  /** The window whose reset the wait aims at, or null when nothing actionable tripped. */
+  binding: { window: WindowId; percent: number; resetsAt: string; resetsAtMs: number } | null;
+  /** Set when a window says there is no room but no reading can say when the room comes back. */
+  unusable: string | null;
+}
+
+/**
+ * One look at the gauge: what fired, what to wait for, and whether anything can be trusted.
+ *
+ * Causes are collected across both windows before a binding window is chosen, because the two
+ * questions are genuinely separate. Which window we wait on is "when can work resume". Which causes
+ * fired is "why did work stop", and a reader deciding whether to raise the threshold needs the
+ * second one whole.
+ */
+function readGate(gauge: Gauge, threshold: number, now: number = Date.now()): GateVerdict {
+  const creditsEnabled = gauge.extraUsageEnabled === true;
+  const causes: GateVerdict['causes'] = [];
+  const actionable: { window: WindowId; percent: number; resetsAt: string; resetsAtMs: number }[] = [];
+  let unusable: string | null = null;
+
+  for (const window of ['fiveHour', 'weekly'] as (keyof UsageWindows)[]) {
+    const reading = gauge.readingFor(window);
+    const percent = reading.percent;
+    if (percent === null) continue;
+    const overThreshold = percent >= threshold;
+    const overPlan = percent >= 100;
+    if (!overThreshold && !overPlan) continue;
+
+    if (overThreshold) causes.push({ window: windowIdFor(window), utilization: percent, kind: 'threshold' });
+    // Independent of the threshold, and independent of which window ends up binding. At the plan
+    // limit an account with credits enabled starts spending money rather than stopping, and that
+    // fact belongs on the event whether or not this is the window being waited out.
+    if (overPlan && creditsEnabled) causes.push({ window: windowIdFor(window), utilization: percent, kind: 'paid_credit_boundary' });
+
+    const usable = usableForPause(window, reading, now);
+    if (usable) actionable.push(usable);
+    else unusable ??= unusableReason(window, percent, reading, now);
+  }
+
+  if (actionable.length === 0) return { causes, binding: null, unusable: causes.length > 0 ? unusable : null };
+
+  // When both windows are full, waiting out the earlier one leaves the later one still blocking, so
+  // the binding window is the one that clears last. It is also the honest number to report: it is
+  // when work can actually resume.
+  const binding = actionable.reduce((worst, entry) => (entry.resetsAtMs > worst.resetsAtMs ? entry : worst));
+  return { causes, binding, unusable: null };
+}
+
+/** What a hold ended as. `refused` means the task must not start at all. */
+export type HoldOutcome =
+  | { paused: boolean; interrupted: false; refusal: null }
+  | { paused: true; interrupted: true; refusal: null }
+  | { paused: true; interrupted: false; refusal: string };
+
 /**
  * Holds a task back while the account it runs on has no room, and measures the hold.
  *
- * Returns `interrupted: true` when the daemon stopped mid-wait, in which case the caller must not
- * start the task: nobody is left to watch it.
+ * One call is one hold, however many times the gauge is re-read inside it. That is Sol's finding 5:
+ * a task that stayed blocked for three rounds used to be reported as three separate incidents, so
+ * the count was inflated, the worst incident was shortened to its longest single round, and the
+ * gaps between rounds vanished from the total even though the task was still held throughout.
+ *
+ * Three ways out, and only one of them starts the task:
+ *
+ *   - the windows come back with room, so the task runs;
+ *   - the daemon stops mid-wait, so nothing starts and nobody is left to watch it;
+ *   - the retry ceiling is reached, so the task is refused.
+ *
+ * That last one is Sol's finding 1 and it was a design error rather than a bug. The ceiling used to
+ * end by starting the task, which turned "never cross into paid credits without a human" into
+ * "cross it on the fourth attempt". A ceiling exists to stop Conductor waiting forever on numbers it
+ * cannot make sense of. It is not a grant of passage, and the honest end of one is a refusal a human
+ * can read and act on.
  */
 export async function pauseForLimits(
   config: Config,
@@ -175,133 +294,207 @@ export async function pauseForLimits(
   task: Task,
   tasksWaiting: number,
   onPause?: (pause: PauseNotice | null) => void,
-): Promise<{ paused: boolean; interrupted: boolean }> {
+): Promise<HoldOutcome> {
   const threshold = readPauseThreshold(config);
-  let paused = false;
+  let hold: Hold | null = null;
+  let rounds = 0;
+  // Summed across rounds, so the predicted cost of a hold is the whole of what it predicted rather
+  // than only its first leg.
+  let plannedTotalMs = 0;
   let lastResetsAtMs = 0;
+
+  const release = (result: HoldOutcome): HoldOutcome => {
+    if (hold) {
+      hold.end(result.interrupted, rounds, plannedTotalMs);
+      onPause?.(null);
+    }
+    return result;
+  };
 
   for (let round = 0; round < MAX_PAUSE_ROUNDS; round++) {
     if (round > 0) gauge.refreshFile();
-    const creditsEnabled = gauge.extraUsageEnabled === true;
+    const gate = readGate(gauge, threshold);
 
-    // Every window that says there is no room, whether or not its reading is solid enough to act on.
-    const tripped: { window: keyof UsageWindows; percent: number }[] = [];
-    for (const window of ['fiveHour', 'weekly'] as (keyof UsageWindows)[]) {
-      const percent = gauge.readingFor(window).percent;
-      if (percent === null) continue;
-      if (percent >= threshold || percent >= 100) tripped.push({ window, percent });
-    }
-    if (tripped.length === 0) return { paused, interrupted: false };
+    if (gate.causes.length === 0) return release({ paused: hold !== null, interrupted: false, refusal: null });
 
-    // Of those, the ones whose reading can say when the wait would end. A pause with no fresh
-    // reading is not a pause, so an unusable one is logged and stepped over rather than guessed at.
-    const actionable = tripped
-      .map((trip) => ({ trip, usable: usableForPause(trip.window, gauge.readingFor(trip.window)) }))
-      .filter((entry): entry is { trip: typeof entry.trip; usable: NonNullable<typeof entry.usable> } => entry.usable !== null);
-
-    if (actionable.length === 0) {
-      logEvent(config, {
-        kind: 'limit_reading_unusable',
-        account: gauge.account,
-        taskId: task.id,
-        reason: unusableReason(tripped[0]!.window, tripped[0]!.percent, gauge.readingFor(tripped[0]!.window)),
-      });
-      return { paused, interrupted: false };
+    if (!gate.binding) {
+      // Something says there is no room and nothing can say when the room returns. Not pausing is
+      // the safe direction here, and it stays the safe direction inside a hold: a wait with no
+      // stated end is not a measurement, it is an outage.
+      logEvent(config, { kind: 'limit_reading_unusable', account: gauge.account, taskId: task.id, reason: gate.unusable ?? 'no usable reading' });
+      return release({ paused: hold !== null, interrupted: false, refusal: null });
     }
 
-    // When both windows are full, waiting out the earlier one leaves the later one still blocking,
-    // so the binding window is the one that clears last. It is also the honest number to report: it
-    // is when work can actually resume.
-    const binding = actionable.reduce((worst, entry) => (entry.usable.resetsAtMs > worst.usable.resetsAtMs ? entry : worst));
-
-    // A second round must be waiting for something new. If the account came back with a reset time
-    // no later than the one we just sat through, its numbers are not moving the way a rolling window
-    // moves, and waiting again would be waiting on a reading we have already disproved.
-    if (round > 0 && binding.usable.resetsAtMs <= lastResetsAtMs) {
+    // A later round must be waiting for something new. If the account comes back with a reset time
+    // no later than the one just sat through, its numbers are not rolling the way a window rolls,
+    // and waiting again would be waiting on a reading already disproved.
+    if (round > 0 && gate.binding.resetsAtMs <= lastResetsAtMs) {
       logEvent(config, {
         kind: 'limit_reading_unusable',
         account: gauge.account,
         taskId: task.id,
         reason:
           `after waiting for ${new Date(lastResetsAtMs).toISOString()} the account still reports the same or an ` +
-          `earlier reset (${binding.usable.resetsAt}) at ${Math.round(binding.usable.percent)}%, so the window is not ` +
-          `rolling the way the reading claims. Starting the task rather than waiting on a number that did not move.`,
+          `earlier reset (${gate.binding.resetsAt}) at ${Math.round(gate.binding.percent)}%, so the window is not ` +
+          `rolling the way the reading claims. Not waiting again on a number that did not move.`,
       });
-      return { paused, interrupted: false };
+      return release({ paused: hold !== null, interrupted: false, refusal: null });
     }
-    lastResetsAtMs = binding.usable.resetsAtMs;
+    lastResetsAtMs = gate.binding.resetsAtMs;
 
-    const startedAt = Date.now();
-    const waitUntilMs = binding.usable.resetsAtMs + RESET_GRACE_MS;
-    const plannedMs = Math.max(0, waitUntilMs - startedAt);
-    const reason: PauseNotice['reason'] =
-      binding.usable.percent >= 100 && creditsEnabled ? 'paid_credit_boundary' : 'threshold';
+    // Revalidated here rather than trusted from the check above, because that check ran against an
+    // earlier `Date.now()` and the reset can fall between the two. Sol's finding 3: a window that
+    // expired in that gap still produced a wait and a pause count, against the rule that an expired
+    // reading never pauses.
+    const startedAtMs = Date.now();
+    if (gate.binding.resetsAtMs <= startedAtMs) {
+      logEvent(config, {
+        kind: 'limit_reading_unusable',
+        account: gauge.account,
+        taskId: task.id,
+        reason:
+          `the ${gate.binding.window === 'session_5h' ? '5-hour' : 'weekly'} window reads ` +
+          `${Math.round(gate.binding.percent)}% and its reset time ${gate.binding.resetsAt} passed while the gate was ` +
+          `being read, so the window it describes is already gone. Not starting a wait for a reset that has happened.`,
+      });
+      return release({ paused: hold !== null, interrupted: false, refusal: null });
+    }
 
-    const bare = {
-      taskId: task.id,
-      account: gauge.account,
-      window: binding.usable.window,
-      utilization: binding.usable.percent,
-      resetsAt: binding.usable.resetsAt,
-      threshold,
-      reason,
-      tasksWaiting,
-      waitUntil: new Date(waitUntilMs).toISOString(),
-    };
-    const notice: PauseNotice = { ...bare, sentence: pauseSentence(bare) };
+    const plannedMs = Math.max(0, gate.binding.resetsAtMs + RESET_GRACE_MS - startedAtMs);
 
-    logEvent(config, {
-      kind: 'limit_pause',
-      account: notice.account,
-      window: notice.window,
-      utilization: Math.round(notice.utilization * 100) / 100,
-      resetsAt: notice.resetsAt,
-      threshold,
-      reason,
-      tasksWaiting,
-      otherAccounts: otherAccountReadings(config, gauge.account),
-    });
-    paused = true;
-    onPause?.(notice);
-    process.stdout.write(`conductor: ${notice.sentence}\n`);
+    if (!hold) {
+      hold = beginHold(config, gauge, task, threshold, tasksWaiting, gate, startedAtMs);
+      onPause?.(hold.notice);
+      process.stdout.write(`conductor: ${hold.notice.sentence}\n`);
+    }
+    rounds = round + 1;
+    plannedTotalMs += plannedMs;
 
-    const interrupted = await waitOutWindow(config, notice, startedAt, plannedMs);
-    onPause?.(null);
-    if (interrupted) return { paused, interrupted: true };
+    if (await hold.wait(plannedMs)) return release({ paused: true, interrupted: true, refusal: null });
   }
 
-  // Every round used and the window still says full. Say so and start: see MAX_PAUSE_ROUNDS.
-  logEvent(config, {
-    kind: 'limit_reading_unusable',
-    account: gauge.account,
-    taskId: task.id,
-    reason: `paused ${MAX_PAUSE_ROUNDS} times and the window still reports no room, so the reading is not something to keep waiting on. Starting the task.`,
-  });
-  return { paused, interrupted: false };
+  // The ceiling. Every round was a fresh reading that still said no room, so the account is not
+  // going to let this task run and Conductor is not going to guess its way past that.
+  const refusal =
+    `held for ${MAX_PAUSE_ROUNDS} rounds and account "${gauge.account}" still reports no room on a fresh reading, ` +
+    `so this task was refused rather than started. Conductor waits for a window to reset; it does not decide that ` +
+    `enough waiting earns a pass, and on an account with extra-usage credits enabled that pass would spend money. ` +
+    `Re-queue the task once the gauge shows room, or raise the pause threshold in the playbook deliberately.`;
+  return release({ paused: true, interrupted: false, refusal });
 }
 
-/** The wait itself. Resolves true when the daemon stopped mid-pause. Logs `limit_resume` either way. */
-function waitOutWindow(config: Config, notice: PauseNotice, startedAt: number, plannedMs: number): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    const finish = (interrupted: boolean): void => {
+/** A hold in progress: the events are its edges, and everything between them is one measurement. */
+interface Hold {
+  notice: PauseNotice;
+  /** Waits out one round. Resolves true when the daemon stopped and the hold is over. */
+  wait(ms: number): Promise<boolean>;
+  /** Writes `limit_resume`. Idempotent, so an interrupt and a timer cannot both close the books. */
+  end(interrupted: boolean, rounds: number, plannedMs: number): void;
+}
+
+function beginHold(
+  config: Config,
+  gauge: Gauge,
+  task: Task,
+  threshold: number,
+  tasksWaiting: number,
+  gate: GateVerdict,
+  startedAtMs: number,
+): Hold {
+  const binding = gate.binding!;
+  const holdId = `h${randomBytes(9).toString('hex')}`;
+  const startedAt = new Date(startedAtMs).toISOString();
+  // Elapsed time comes off a monotonic clock. Sol's finding 3: with wall-clock subtraction a system
+  // clock stepping backwards during a real hour-long wait produces a negative lostMs, which the
+  // report would then subtract from the total, and a forward correction invents time nobody waited.
+  const startedAtMonotonic = performance.now();
+
+  // The strongest cause across every window, not the binding window's own. A weekly window can bind
+  // the wait while the five-hour window is the one sitting on the money line.
+  const reason: PauseNotice['reason'] = gate.causes.some((cause) => cause.kind === 'paid_credit_boundary')
+    ? 'paid_credit_boundary'
+    : 'threshold';
+
+  const bare = {
+    taskId: task.id,
+    account: gauge.account,
+    window: binding.window,
+    utilization: binding.percent,
+    resetsAt: binding.resetsAt,
+    threshold,
+    reason,
+    tasksWaiting,
+    waitUntil: new Date(binding.resetsAtMs + RESET_GRACE_MS).toISOString(),
+  };
+  const notice: PauseNotice = { ...bare, holdId, startedAt, sentence: pauseSentence(bare, gate.causes) };
+
+  logEvent(config, {
+    kind: 'limit_pause',
+    holdId,
+    taskId: task.id,
+    account: gauge.account,
+    startedAt,
+    window: binding.window,
+    utilization: round2(binding.percent),
+    resetsAt: binding.resetsAt,
+    threshold,
+    reason,
+    causes: gate.causes.map((cause) => ({ ...cause, utilization: round2(cause.utilization) })),
+    creditsEnabled: gauge.extraUsageEnabled,
+    creditsFresh: gauge.extraUsageFresh,
+    tasksWaiting,
+    otherAccounts: otherAccountReadings(config, gauge.account),
+  });
+
+  let settled = false;
+  let timer: NodeJS.Timeout | null = null;
+  let interruptRound: ((interrupted: boolean) => void) | null = null;
+
+  const entry: ActivePause = {
+    finish: (interrupted: boolean) => {
+      if (settled) return;
+      if (timer) clearTimeout(timer);
+      interruptRound?.(interrupted);
+    },
+  };
+  activePauses.add(entry);
+
+  return {
+    notice,
+    wait: (ms: number) =>
+      new Promise<boolean>((resolve) => {
+        let done = false;
+        const settleRound = (interrupted: boolean): void => {
+          if (done) return;
+          done = true;
+          if (timer) clearTimeout(timer);
+          timer = null;
+          interruptRound = null;
+          resolve(interrupted);
+        };
+        interruptRound = settleRound;
+        timer = setTimeout(() => settleRound(false), ms);
+      }),
+    end: (interrupted: boolean, rounds: number, plannedMs: number) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       activePauses.delete(entry);
       logEvent(config, {
         kind: 'limit_resume',
-        account: notice.account,
-        lostMs: Date.now() - startedAt,
+        holdId,
+        taskId: task.id,
+        account: gauge.account,
+        startedAt,
+        // Rounded, not floored: this is a duration in milliseconds and Math.max keeps a monotonic
+        // clock that somehow went backwards from producing a negative one.
+        lostMs: Math.max(0, Math.round(performance.now() - startedAtMonotonic)),
         plannedMs,
+        rounds,
         interrupted,
       });
-      resolve(interrupted);
-    };
-    const timer = setTimeout(() => finish(false), plannedMs);
-    const entry: ActivePause = { finish };
-    activePauses.add(entry);
-  });
+    },
+  };
 }
 
 // Task ids currently being worked, process-wide. Sol's pass 2 finding 3: nothing marked or removed
@@ -369,20 +562,24 @@ export async function runTasks(tasks: Task[], options: RunTasksOptions = {}): Pr
       // making a worktree and then sitting on it for hours leaves a copy of the user's repo pinned
       // to a commit that ages while nothing works in it.
       const held = await pauseForLimits(config, gauge, task, claimed.length - index, options.onPause);
-      if (held.interrupted) {
-        const stopped: TaskRun = {
+      // Two ways a hold ends without the task running, and both refuse rather than downgrade. The
+      // refusal case is the retry ceiling: the account still has no room after every round, so the
+      // task is blocked exactly like the trust and account gates above block one.
+      if (held.interrupted || held.refusal) {
+        const blocked: TaskRun = {
           taskId: task.id,
           sessionId: undefined,
           outcome: 'blocked',
           handoffPath: null,
           followUps: [],
           usage: {},
-          errorText: 'the daemon stopped while this task was waiting for a limit window to reset, so it never started',
+          errorText: held.refusal ?? 'the daemon stopped while this task was waiting for a limit window to reset, so it never started',
         };
-        runs.push(stopped);
+        runs.push(blocked);
         logTaskFinish(config, task.id, 'blocked', null, null, {});
-        options.onTaskFinish?.(stopped);
-        break; // the process is going down; the tasks behind this one are not ours to start either
+        options.onTaskFinish?.(blocked);
+        if (held.interrupted) break; // the process is going down; the tasks behind this one are not ours to start
+        continue; // the ceiling is this task's problem; the next one gets its own look at the gauge
       }
       if (held.paused) gauge.refreshBeforeTask(); // the numbers moved while we waited; log where they landed
 

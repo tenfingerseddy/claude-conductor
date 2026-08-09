@@ -270,30 +270,46 @@ async function lostTime(args: string[]): Promise<number> {
   const accounts = Array.isArray(report['accounts']) ? report['accounts'] : [];
   const total = asRecord(report['total']);
   const unmatched = Array.isArray(report['unmatched']) ? report['unmatched'] : [];
+  const malformed = Array.isArray(report['malformed']) ? report['malformed'] : [];
 
-  out(`lost time to usage limits, last ${String(report['days'])} day(s), since ${String(report['from'])}`);
+  out(`lost time to usage limits, last ${String(report['days'])} day(s), ${String(report['from'])} to ${String(report['to'])}`);
   out('');
   if (accounts.length === 0) {
-    out('  no pauses recorded in this period. Nothing has been held back waiting for a limit to reset.');
+    out('  no holds recorded in this period. Nothing has been held back waiting for a limit to reset.');
     return 0;
   }
 
-  out(`  ${'account'.padEnd(14)}${'pauses'.padStart(7)}${'lost'.padStart(11)}${'longest'.padStart(11)}${'recoverable'.padStart(13)}`);
+  // "holds" rather than "pauses", because one hold can span several re-reads of the gauge and the
+  // count is of halts, not of times Conductor looked.
+  out(`  ${'account'.padEnd(14)}${'holds'.padStart(6)}${'rounds'.padStart(7)}${'lost'.padStart(11)}${'longest'.padStart(11)}${'recoverable'.padStart(13)}`);
   for (const raw of accounts) {
     const row = asRecord(raw);
     out(
-      `  ${String(row['account']).padEnd(14)}${String(row['pauses']).padStart(7)}` +
+      `  ${String(row['account']).padEnd(14)}${String(row['holds']).padStart(6)}${String(row['rounds']).padStart(7)}` +
         `${duration(row['lostMs']).padStart(11)}${duration(row['longestMs']).padStart(11)}${duration(row['recoverableMs']).padStart(13)}`,
     );
   }
-  out(`  ${'total'.padEnd(14)}${String(total['pauses'] ?? 0).padStart(7)}${duration(total['lostMs']).padStart(11)}${duration(total['longestMs']).padStart(11)}${duration(total['recoverableMs']).padStart(13)}`);
+  out(
+    `  ${'total'.padEnd(14)}${String(total['holds'] ?? 0).padStart(6)}${String(total['rounds'] ?? 0).padStart(7)}` +
+      `${duration(total['lostMs']).padStart(11)}${duration(total['longestMs']).padStart(11)}${duration(total['recoverableMs']).padStart(13)}`,
+  );
 
   if (unmatched.length > 0) {
     out('');
-    out(`  ${unmatched.length} pause(s) have no recorded end, so their length is unknown and is not in the totals:`);
+    out(`  ${unmatched.length} hold(s) have no recorded end, so their length is unknown and is not in the totals:`);
     for (const raw of unmatched) {
       const row = asRecord(raw);
-      out(`    ${String(row['account'])} at ${String(row['at'])}, ${String(row['window'])} window, ${String(row['reason'])}`);
+      const open = row['stillOpen'] === true ? ', and may still be running now' : '';
+      out(`    ${String(row['account'])} task ${String(row['taskId'])} at ${String(row['at'])}, ${String(row['window'])} window, ${String(row['reason'])}${open}`);
+    }
+  }
+
+  if (malformed.length > 0) {
+    out('');
+    out(`  ${malformed.length} hold(s) recorded a duration this report will not believe, so they contribute no time:`);
+    for (const raw of malformed) {
+      const row = asRecord(raw);
+      out(`    ${String(row['account'])} task ${String(row['taskId'])} at ${String(row['at'])}: ${String(row['problem'])}`);
     }
   }
 
@@ -404,7 +420,9 @@ function render(event: Record<string, unknown>): string | null {
     return `=== task ${String(event['taskId'])} finished: ${String(event['outcome'])}${error} ===\n  handoff: ${String(event['handoffPath'] ?? 'none')}`;
   }
   if (type === 'limit_pause') return `\n--- ${String(event['sentence'])}\n    Ctrl+C still works, and "conductor stop" ends the wait and logs what it cost.`;
-  if (type === 'limit_resume') return '--- the wait is over; starting the task.';
+  // Deliberately does not say the task is starting. A hold can end in the task being refused, and
+  // the line that follows says which; announcing a start here printed it just before a refusal.
+  if (type === 'limit_resume') return '--- the wait is over.';
   if (type === 'run_started') return `run started over ${(event['tasks'] as unknown[] | undefined)?.length ?? 0} task(s)`;
   if (type === 'run_done') return 'run done.';
   if (type === 'run_error') return `run error: ${String(event['error'])}`;

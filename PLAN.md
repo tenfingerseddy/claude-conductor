@@ -779,6 +779,20 @@ actually pauses.
   unmatched pause and the report reconciled by hand, all through the real daemon and CLI on a
   scratch state root. Transcripts in `docs/notes/m2-losttime-findings.md`. Two wording defects found
   and fixed during verification, both recorded there.
+- **Sol review: blocked, seven findings, all accepted.** `docs/notes/sol-review-m2-losttime.md`. One
+  dimension only, whether the numbers can be trusted, because they exist to justify a purchase.
+  Finding 1 was a design error rather than a bug: the retry ceiling ended by starting the task, which
+  turned the paid-credit hard rail into a three-strikes rule. The other six were ways the figures
+  could overstate, understate, misattribute, or rest on evidence the gauge itself would refuse.
+- **Fix round landed**, `docs/notes/m2-losttime-fix-findings.md`. All seven closed:
+  the ceiling now refuses the task and logs why; recoverable time counts only other-account readings
+  that were usable by the same test the pause gate applies, with freshness recorded per window on the
+  snapshot; elapsed time comes off a monotonic clock and the reset is revalidated at the instant the
+  wait starts; the report intersects each hold with the reporting window instead of filtering on
+  pause-start; holds carry an id and a task id so pairing survives overlap and re-read rounds group
+  into one incident; the threshold parser anchors its number and rejects `1000%`, `1e2` and `0.5`
+  out loud; and every cause is recorded per window, so a weekly wait no longer hides a five-hour
+  window sitting on the money line. Sol's six what-holds lines were re-verified after the changes.
 - **Slice D builds on this.** The pause primitive is the mechanism slice D's scheduler drives: when
   the queue learns to hold heavy work for a reset and fill the remaining headroom with light work,
   it does the holding through this, and the lost-time number is how anyone tells whether the pacing

@@ -75,6 +75,12 @@ export interface FileUsage extends UsageWindows {
    * different `extra_usage` shapes, so an unreadable block must not be read as "it will just stop".
    */
   extraUsageEnabled: boolean | null;
+  /**
+   * How fresh the whole block is, by the same `fetchedAtMs` test the window readings use. Carried
+   * separately because the credit setting is not a window and has no reset of its own, and Sol's
+   * finding 7 was that it was being used to label a pause with no freshness qualification at all.
+   */
+  fileConfidence: Confidence;
 }
 
 /** Layer 1. Returns null for "no reading" on absolutely anything unexpected. */
@@ -152,7 +158,7 @@ export function readOfficialFile(configDir: string, now: number = Date.now()): F
 
   const utilization = block['utilization'];
   if (!isRecord(utilization)) {
-    return { fetchedAtMs, ageMs, extraUsageEnabled: null, fiveHour: ABSENT_READING, weekly: ABSENT_READING };
+    return { fetchedAtMs, ageMs, extraUsageEnabled: null, fileConfidence: confidence, fiveHour: ABSENT_READING, weekly: ABSENT_READING };
   }
 
   const extra = utilization['extra_usage'];
@@ -162,6 +168,7 @@ export function readOfficialFile(configDir: string, now: number = Date.now()): F
     fetchedAtMs,
     ageMs,
     extraUsageEnabled: typeof enabledRaw === 'boolean' ? enabledRaw : null,
+    fileConfidence: confidence,
     fiveHour: windowReading(utilization['five_hour'], 'official_file', confidence),
     weekly: windowReading(utilization['seven_day'], 'official_file', confidence),
   };
@@ -303,6 +310,15 @@ export class Gauge {
    */
   get extraUsageEnabled(): boolean | null {
     return this.file?.extraUsageEnabled ?? null;
+  }
+
+  /**
+   * Whether the credit setting above was read from a block fresh enough to trust. False when there
+   * is no file, or when its `fetchedAtMs` puts it outside the staleness window, so a caller that
+   * labels a pause with it can say how much weight the label carries.
+   */
+  get extraUsageFresh(): boolean {
+    return this.file?.fileConfidence === 'fresh';
   }
 
   /** The highest-trust reading for a window, for callers outside the gauge. Read only. */

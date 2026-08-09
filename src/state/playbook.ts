@@ -79,14 +79,45 @@ export function readPlaybook(config: Config): string {
 export const DEFAULT_PAUSE_THRESHOLD_PERCENT = 95;
 
 /**
- * Reads `pause threshold: N%` out of the playbook, leniently, because the playbook is a page a
- * human writes in plain language and not a config file. Any spacing, an optional percent sign, a
- * decimal, and any surrounding prose on the line are all fine. Anything else, including a number
- * outside 1 to 100, falls back to the default rather than failing: a policy page with a typo in it
- * must not decide that every task is allowed to run into a wall, nor that none may start.
+ * Reads `pause threshold: N%` out of the playbook. Lenient about the things a human varies, strict
+ * about the number itself, and loud when it refuses one.
+ *
+ * Sol's finding 6 was that the first version promised a 1-to-100 integer and delivered none of it.
+ * The pattern did not end after the digits, so `1000%` matched its first three characters and became
+ * 100, silently raising the threshold to the point where almost nothing pauses and the lost-time
+ * report reads as a clean bill of health. `1e2` became 1, which pauses nearly everything. `0.5` was
+ * accepted against a documented range that excludes it. A typo on a policy page must never quietly
+ * decide the pacing, so the numeric token now has to stand alone: digits, an optional percent sign,
+ * then end of line or whitespace, and nothing else.
+ *
+ * Integers only. A fractional threshold is not a thing the gauge can act on more precisely than a
+ * whole number, and accepting one would mean the documented range and the accepted range differ
+ * again, which is the defect rather than a smaller version of it.
+ *
+ * A rejected value goes to stderr and the default is used. It is not a logbook event: the effective
+ * threshold rides on every `limit_pause` line already, so the number that actually governed a pause
+ * is always recoverable from the log, and the reject is an operator message about a file they can
+ * fix.
  */
 export function readPauseThreshold(config: Config): number {
-  const match = /pause\s+threshold\s*[:=]\s*(\d{1,3}(?:\.\d+)?)\s*%?/i.exec(readPlaybook(config));
-  const parsed = match?.[1] === undefined ? NaN : Number(match[1]);
-  return Number.isFinite(parsed) && parsed > 0 && parsed <= 100 ? parsed : DEFAULT_PAUSE_THRESHOLD_PERCENT;
+  const text = readPlaybook(config);
+  // The whole candidate, so a rejected one can be quoted back rather than described.
+  const candidate = /pause\s+threshold\s*[:=]\s*(\S+)/i.exec(text)?.[1];
+  if (candidate === undefined) return DEFAULT_PAUSE_THRESHOLD_PERCENT;
+
+  // Two shapes and no third. With a percent sign, ordinary sentence punctuation may follow, because
+  // "pause threshold: 95%." is how the seeded page writes it. Without one, a following full stop is
+  // refused, so "0.5" and "95.5" are rejected outright rather than silently truncated to 0 and 95.
+  const matched = /^(?:(\d{1,3})%(?=$|[\s.,;)])|(\d{1,3})(?=$|[\s,;)]))/.exec(candidate);
+  const digits = matched?.[1] ?? matched?.[2];
+  const parsed = digits === undefined ? NaN : Number(digits);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+    process.stderr.write(
+      `conductor: "${config.playbookPath}" sets a pause threshold of "${candidate}", which is not a whole ` +
+        `number of percent between 1 and 100. Using the default of ${DEFAULT_PAUSE_THRESHOLD_PERCENT}% instead. ` +
+        `Fix the line if that is not what you meant, because this number decides when work stops.\n`,
+    );
+    return DEFAULT_PAUSE_THRESHOLD_PERCENT;
+  }
+  return parsed;
 }
