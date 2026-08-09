@@ -1,5 +1,15 @@
 # Conductor build plan
 
+## Superseded, 2026-08-09
+
+**The program pivoted to Drover** (`../drover`), a distributed orchestration system running
+Claude and Codex workers across Kane's three-machine fleet. Kane's call, in his own words, after
+investigating herdr. Conductor is superseded as a product; this repo stays as the evidence trail,
+because Drover ports its proven organs (worktree isolation, the gauge, lost time, the rails, cut
+discipline) and every port cites the reviews here. Nothing below this line is a plan anymore;
+read it as history. The unmerged `feat/m2-lost-time` branch holds the lost-time fix round,
+verified but awaiting a Sol confirmation pass that Drover's M2 now owns.
+
 ## State of play, 2026-08-02
 
 **Isolation is built, wired, reviewed and merged to main.** `src/engine/isolation.ts` gives each
